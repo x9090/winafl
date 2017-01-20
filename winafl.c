@@ -94,6 +94,7 @@ static winafl_data_t winafl_data;
 
 typedef struct _fuzz_target_t {
     reg_t xsp;            /* stack level at entry to the fuzz target */
+	reg_t xcx;
     app_pc func_pc;
     int iteration;
 } fuzz_target_t;
@@ -183,6 +184,7 @@ onexception(void *drcontext, dr_exception_t *excpt) {
        (exception_code == EXCEPTION_ILLEGAL_INSTRUCTION) ||
        (exception_code == EXCEPTION_PRIV_INSTRUCTION) ||
        (exception_code == EXCEPTION_STACK_OVERFLOW)) {
+		//__debugbreak();
           if(options.debug_mode)
             dr_fprintf(winafl_data.log, "crashed\n");
           if(!options.debug_mode)
@@ -192,11 +194,11 @@ onexception(void *drcontext, dr_exception_t *excpt) {
     return true;
 }
 
-
 static dr_emit_flags_t
 instrument_bb_coverage(void *drcontext, void *tag, instrlist_t *bb, instr_t *inst,
                       bool for_trace, bool translating, void *user_data)
 {
+	static bool debug_information_output = false;
     app_pc start_pc;
     module_entry_t **mod_entry_cache;
     module_entry_t *mod_entry;
@@ -222,7 +224,7 @@ instrument_bb_coverage(void *drcontext, void *tag, instrlist_t *bb, instr_t *ins
     should_instrument = false;
     target_modules = options.target_modules;
     while(target_modules) {
-        if(strcmp(module_name, target_modules->module_name) == 0) {
+		if (_stricmp(module_name, target_modules->module_name) == 0) {
             should_instrument = true;
             break;
         }
@@ -230,6 +232,7 @@ instrument_bb_coverage(void *drcontext, void *tag, instrlist_t *bb, instr_t *ins
     }
     if(!should_instrument) return DR_EMIT_DEFAULT;
 
+	//__debugbreak();	// Never hit here in debug mode?
     offset = (uint)(start_pc - mod_entry->data->start);
     offset &= MAP_SIZE - 1;
     
@@ -248,6 +251,7 @@ static dr_emit_flags_t
 instrument_edge_coverage(void *drcontext, void *tag, instrlist_t *bb, instr_t *inst,
                       bool for_trace, bool translating, void *user_data)
 {
+	static bool debug_information_output = false;
     app_pc start_pc;
     module_entry_t **mod_entry_cache;
     module_entry_t *mod_entry;
@@ -279,7 +283,7 @@ instrument_edge_coverage(void *drcontext, void *tag, instrlist_t *bb, instr_t *i
     should_instrument = false;
     target_modules = options.target_modules;
     while(target_modules) {
-        if(strcmp(module_name, target_modules->module_name) == 0) {
+        if(_stricmp(module_name, target_modules->module_name) == 0) {
             should_instrument = true;
             break;
         }
@@ -366,14 +370,16 @@ instrument_edge_coverage(void *drcontext, void *tag, instrlist_t *bb, instr_t *i
 static void
 pre_fuzz_handler(void *wrapcxt, INOUT void **user_data)
 {
+	//__debugbreak();
     char command = 0;
     int i;
     DWORD num_read;
-
+	
     app_pc target_to_fuzz = drwrap_get_func(wrapcxt);
     dr_mcontext_t *mc = drwrap_get_mcontext_ex(wrapcxt, DR_MC_ALL);
 
     fuzz_target.xsp = mc->xsp;
+	fuzz_target.xcx = mc->xcx;
     fuzz_target.func_pc = target_to_fuzz;
 
     if(!options.debug_mode) {
@@ -388,16 +394,18 @@ pre_fuzz_handler(void *wrapcxt, INOUT void **user_data)
         }
     } else {
         debug_data.pre_hanlder_called++;
-        dr_fprintf(winafl_data.log, "In pre_fuzz_handler\n");
+		dr_fprintf(winafl_data.log, "In pre_fuzz_handler: 0x%08x\n", target_to_fuzz);
     }
 
     //save or restore arguments
     if(fuzz_target.iteration == 0) {
         for(i = 0; i < options.num_fuz_args; i++) {
             options.func_args[i] = drwrap_get_arg(wrapcxt, i);
+			dr_fprintf(winafl_data.log, "get arg(%d): 0x%x\n", i, options.func_args[i]);
         }
     } else {
         for(i = 0; i < options.num_fuz_args; i++) {
+			dr_fprintf(winafl_data.log, "set arg(%d): 0x%x\n", i, options.func_args[i]);
             drwrap_set_arg(wrapcxt, i, options.func_args[i]);
         }
     }
@@ -409,14 +417,16 @@ pre_fuzz_handler(void *wrapcxt, INOUT void **user_data)
 static void
 post_fuzz_handler(void *wrapcxt, void *user_data)
 {
+	//__debugbreak();
     DWORD num_written;
     dr_mcontext_t *mc = drwrap_get_mcontext(wrapcxt);
+	app_pc addr = drwrap_get_func(wrapcxt);
 
     if(!options.debug_mode) {
         WriteFile(pipe, "K", 1, &num_written, NULL);
     } else {
         debug_data.post_handler_called++;
-        dr_fprintf(winafl_data.log, "In post_fuzz_handler\n");
+        dr_fprintf(winafl_data.log, "In post_fuzz_handler: 0x%08x\n", addr);
     }
 
     fuzz_target.iteration++;
@@ -425,8 +435,8 @@ post_fuzz_handler(void *wrapcxt, void *user_data)
     }
 
     mc->xsp = fuzz_target.xsp;
+	mc->xcx = fuzz_target.xcx;
     mc->pc = fuzz_target.func_pc;
-
     drwrap_redirect_execution(wrapcxt);
 }
 
@@ -465,7 +475,7 @@ event_module_load(void *drcontext, const module_data_t *info, bool loaded)
         dr_fprintf(winafl_data.log, "Module loaded, %s\n", module_name);
 
     if(options.fuzz_module[0]) {
-        if(strcmp(module_name, options.fuzz_module) == 0) {
+		if (_stricmp(module_name, options.fuzz_module) == 0) {
             if(options.fuzz_offset) {
                 to_wrap = info->start + options.fuzz_offset;
             } else {
@@ -475,7 +485,7 @@ event_module_load(void *drcontext, const module_data_t *info, bool loaded)
             drwrap_wrap(to_wrap, pre_fuzz_handler, post_fuzz_handler);
         }
     
-        if(options.debug_mode && (strcmp(module_name, "KERNEL32.dll") == 0)) {
+		if (options.debug_mode && (_stricmp(module_name, "KERNEL32.dll") == 0)) {
             to_wrap = (app_pc)dr_get_proc_address(info->handle, "CreateFileW");
             drwrap_wrap(to_wrap, createfilew_interceptor, NULL);
             to_wrap = (app_pc)dr_get_proc_address(info->handle, "CreateFileA");
@@ -710,7 +720,8 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
     if(!options.debug_mode) {
         setup_pipe();
         setup_shmem();
-    } else {
+    }
+    else {
         winafl_data.afl_area = (unsigned char *)dr_global_alloc(MAP_SIZE);
     }
 

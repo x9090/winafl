@@ -39,6 +39,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <math.h>
+#include <tlhelp32.h>
 
 time_t start_time, end_time;
 
@@ -53,24 +54,38 @@ static uint verbose;
         dr_fprintf(STDERR, fmt, __VA_ARGS__); \
 } while (0)
 
-#ifdef _DEBUG
-void dbgprint(char *fmt, ...) 
+void dbgprint(char *fmt, ...)
 {
-    do {                      
+    do {
         va_list arg;
         char buffer[4096] = { 0 };
 
         va_start(arg, fmt);
-        _vsnprintf(buffer, 4096, fmt, arg);
+        dr_vsnprintf(buffer, 4096, fmt, arg);
         va_end(arg);
 
         OutputDebugStringA(buffer);
     } while (0);
 }
+
+#ifdef _DEBUG
+#define DEBUG_PRINT dbgprint        
 #else 
-void dbgprint(char *fmt, ...){
-    return;
-}
+#define DEBUG_PRINT
+#endif
+
+// Make it optional for GUI-based software (eg: Microsoft Office or Windows Media Player)
+#ifdef _WMP
+#define MAXIMUM_MESSAGE_IDS 256
+BOOL	g_BoolShouldProceed = false;
+/*	Maximum wait time (ms) for the next input iteration.
+*	Must be smaller than client time-out value specified
+*	in afl-fuzz CreateNamePipe function and also exec_tmout
+*	(using -t option)
+*/
+UINT64	g_WaitTimeMs = 10000; 
+// This is a maximum count of continuous message id hit by GetMessage API
+int		g_MaxCountMessageIdOccurred = 1000;
 #endif
 
 #define OPTION_MAX_LENGTH MAXIMUM_PATH
@@ -86,6 +101,7 @@ typedef struct _target_module_t {
 #else
     uint base;
 #endif
+    bool marked_to_log;
     struct _target_module_t *next;
 } target_module_t;
 
@@ -125,6 +141,7 @@ typedef struct _winafl_option_t {
      */
     bool nudge_kills;
     bool debug_mode;
+	bool single_test_case;
     int coverage_kind;
     char logdir[MAXIMUM_PATH];
     char covlogdir[MAXIMUM_PATH];
@@ -140,6 +157,9 @@ typedef struct _winafl_option_t {
     void **func_args;
     int num_fuz_args;
     int file_arg_index;
+#ifdef _WMP
+	int messageid[MAXIMUM_MESSAGE_IDS];
+#endif
 } winafl_option_t;
 static winafl_option_t options;
 
@@ -160,6 +180,7 @@ static winafl_data_t winafl_data;
 
 typedef struct _cov_target_t {
     reg_t xsp;            /* stack level at entry to the fuzz target */
+	reg_t xcx;            /* stack level at entry to the fuzz target */
     app_pc func_pc;
     char *cur_input;      /* Current test case file name obtained from g_filelist */
     char *cur_covlog;
@@ -196,6 +217,47 @@ static HANDLE pipe;
 /****************************************************************************
 * Helper functions
 */
+int get_parent_pid()
+{
+    HANDLE hSnapshot;
+    PROCESSENTRY32 pe32;
+    DWORD ppid = 0, pid = dr_get_process_id();
+
+    hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    __try{
+        if (hSnapshot == INVALID_HANDLE_VALUE) __leave;
+
+        ZeroMemory(&pe32, sizeof(pe32));
+        pe32.dwSize = sizeof(pe32);
+        if (!Process32First(hSnapshot, &pe32)) __leave;
+
+        do{
+            if (pe32.th32ProcessID == pid){
+                ppid = pe32.th32ParentProcessID;
+                break;
+            }
+        } while (Process32Next(hSnapshot, &pe32));
+
+    }
+    __finally{
+        if (hSnapshot != INVALID_HANDLE_VALUE) CloseHandle(hSnapshot);
+    }
+    return ppid;
+}
+
+/* Get current time in milliseconds */
+static uint64 get_cur_time(void) {
+
+	uint64 ret;
+	FILETIME filetime;
+	GetSystemTimeAsFileTime(&filetime);
+
+	ret = (((uint64)filetime.dwHighDateTime) << 32) + (uint64)filetime.dwLowDateTime;
+
+	return ret / 10000;
+
+}
+
 static char *
 get_cov_result_filenameA(IN char *testcase_name)
 {
@@ -288,18 +350,25 @@ onexception(void *drcontext, dr_exception_t *excpt) {
     if((exception_code == EXCEPTION_ACCESS_VIOLATION) || (exception_code == EXCEPTION_ILLEGAL_INSTRUCTION) ||
        (exception_code == EXCEPTION_PRIV_INSTRUCTION) || (exception_code == EXCEPTION_STACK_OVERFLOW)) 
     {
+        //__debugbreak();
         // Redirect execution to our specified start function
         dr_fprintf(winafl_data.log, "crashed at %08x\n", excpt->mcontext->pc);
-        //__debugbreak();
-        excpt->mcontext->xsp = cov_target.xsp;
-        excpt->mcontext->pc = cov_target.func_pc;
-        cov_target.bcrashed = (bool)true;
-        dr_redirect_execution(excpt->mcontext);
-        DR_ASSERT_MSG(false, "should not reach here");
+        dr_fprintf(cov_target.log, "crashed at %08x\n", excpt->mcontext->pc);
+        if (options.corpus_list)
+        {
+            excpt->mcontext->xsp = cov_target.xsp;
+            excpt->mcontext->pc = cov_target.func_pc;
+            cov_target.bcrashed = (bool)true;
+            dr_redirect_execution(excpt->mcontext);
+            DR_ASSERT_MSG(false, "should not reach here");
+        }
+        else
+            dr_exit_process(1);
     }
     return true;
 }
 
+uint64 start_instru_ms = 0; /* A time to indicate when the last instrumentation was started (ms) */
 static dr_emit_flags_t
 event_basic_block_analysis(void *drcontext, void *tag, instrlist_t *bb,
 bool for_trace, bool translating, OUT void **user_data)
@@ -316,7 +385,7 @@ bool for_trace, bool translating, OUT void **user_data)
     int mod_index = 0;
     start_pc = dr_fragment_app_pc(tag);
 
-    //dbgprint("%s:%d:%s: Pre BB hit at block %08x (translating:%d)\n", __FUNCTION__, __LINE__, cov_target.cur_covlog, start_pc, translating);
+    //DEBUG_PRINT("%s:%d:%s: Pre BB hit at block %08x (translating:%d)\n", __FUNCTION__, __LINE__, cov_target.cur_covlog, start_pc, translating);
 
     /* do nothing for translation */
     if (translating)
@@ -331,8 +400,9 @@ bool for_trace, bool translating, OUT void **user_data)
     module_name = dr_module_preferred_name(mod_entry->data);
     should_instrument = false;
     target_modules = options.target_modules;
+
     while (target_modules) {
-        if (strcmp(module_name, target_modules->module_name) == 0) {
+        if (_stricmp(module_name, target_modules->module_name) == 0) {
             should_instrument = true;
             break;
         }
@@ -348,6 +418,13 @@ bool for_trace, bool translating, OUT void **user_data)
     if (cov_target.log == NULL) should_instrument = false;
 
     if (!should_instrument) return DR_EMIT_DEFAULT;
+
+	/*
+	*  Get the start time of the instrumentation
+	*  that can be used to determine if we should start
+	*  next input
+	*/
+	start_instru_ms = get_cur_time();
 
     /* Collect the number of instructions and the basic block size,
     * assuming the basic block does not have any elision on control
@@ -367,14 +444,27 @@ bool for_trace, bool translating, OUT void **user_data)
             end_pc = pc + len;
     }
   
+    /*
+    *  Analyzer required the module information for post processing later
+    */
+    if (!target_modules->marked_to_log)
+    {
+        char buff_modentry[4096] = { 0 };
+        dr_snprintf(buff_modentry, BUFFER_SIZE_ELEMENTS(buff_modentry), "%s|%02d\n", module_name, mod_entry->id);
+        dr_write_file(cov_target.log, buff_modentry, strlen(buff_modentry));
+        target_modules->marked_to_log = true;
+    }
+
     char bb_entry[4096] = { 0 };
 #ifdef _WIN64
     dr_snprintf(bb_entry, BUFFER_SIZE_ELEMENTS(bb_entry), "%d|%I64x\n", mod_entry->id, offset);
 #else
     dr_snprintf(bb_entry, BUFFER_SIZE_ELEMENTS(bb_entry), "%d|%08x\n", mod_entry->id, offset);
 #endif
-    dbgprint("%s:%d:%s: Post BB hit at block %08x\n", __FUNCTION__, __LINE__, cov_target.cur_covlog, offset);
+    DEBUG_PRINT("%s:%d:%s: Post BB hit at block %08x\n", __FUNCTION__, __LINE__, cov_target.cur_covlog, offset);
     dr_write_file(cov_target.log, bb_entry, strlen(bb_entry));
+
+
 
     return DR_EMIT_DEFAULT;
 }
@@ -406,7 +496,7 @@ instrument_bb_coverage(void *drcontext, void *tag, instrlist_t *bb, instr_t *ins
     should_instrument = false;
     target_modules = options.target_modules;
     while(target_modules) {
-        if(strcmp(module_name, target_modules->module_name) == 0) {
+        if(stricmp(module_name, target_modules->module_name) == 0) {
             should_instrument = true;
             break;
         }
@@ -461,7 +551,7 @@ instrument_edge_coverage(void *drcontext, void *tag, instrlist_t *bb, instr_t *i
     should_instrument = false;
     target_modules = options.target_modules;
     while(target_modules) {
-        if(strcmp(module_name, target_modules->module_name) == 0) {
+        if(_stricmp(module_name, target_modules->module_name) == 0) {
             should_instrument = true;
             break;
         }
@@ -546,9 +636,61 @@ instrument_edge_coverage(void *drcontext, void *tag, instrlist_t *bb, instr_t *i
 }
 
 static void
+helper_prepare_cov_log()
+{
+	char cur_cov_log[MAXIMUM_PATH] = { 0 };
+	cov_target.log = NULL;
+
+	if (cov_target.cur_covlog == NULL)
+	{
+		cov_target.cur_covlog = (char*)dr_global_alloc(MAXIMUM_PATH);
+	}
+
+	if (options.corpus_list || g_filelist)
+		cov_target.cur_input = g_filelist->file_name;
+
+	// Some safety check
+	DR_ASSERT_MSG(cov_target.cur_covlog != NULL, "Something wrong with coverage log dir");
+	DR_ASSERT_MSG(cov_target.cur_input != NULL, "Current input is empty");
+
+	// Setup current input filename and the associated coverage log filename
+	memset(cov_target.cur_covlog, 0, MAXIMUM_PATH);
+
+	// Get the coverage log filename ready and open it for witting
+	strncpy(cur_cov_log, get_cov_result_filenameA(cov_target.cur_input), MAXIMUM_PATH);
+	cov_target.log = drx_open_unique_file(options.covlogdir, cur_cov_log, "cov.result", DR_FILE_ALLOW_LARGE, cov_target.cur_covlog, MAXIMUM_PATH);
+
+	// Some safety check
+	DR_ASSERT_MSG(cov_target.log != INVALID_FILE, "Unable to create coverage log file");
+
+	DEBUG_PRINT("%s:%d: Initialized covlog: %s\n", __FUNCTION__, __LINE__, cov_target.cur_covlog);
+}
+
+static void
+helper_next_cov_log()
+{
+	if (!options.single_test_case)
+	{
+		DEBUG_PRINT("%s:%d: Closed cur_input: %s (iter:%d, cov_iter: %d)\n", __FUNCTION__, __LINE__, cov_target.cur_covlog, cov_target.iteration, options.cov_iterations);
+		
+		if (cov_target.cur_input != NULL)
+			dr_global_free(cov_target.cur_input, MAXIMUM_PATH);
+
+		cov_target.cur_input = NULL;
+
+		// Next input corpus
+		if (options.corpus_list)
+			g_filelist = g_filelist->next;
+	}
+	else
+	{
+		cov_target.cur_input = g_filelist->file_name;
+	}
+}
+
+static void
 pre_fuzz_handler(void *wrapcxt, INOUT void **user_data)
 {
-    char cur_cov_log[MAXIMUM_PATH] = { 0 };
     int i;
     DWORD num_read;
 	
@@ -557,9 +699,8 @@ pre_fuzz_handler(void *wrapcxt, INOUT void **user_data)
 
     /* Initialize coverage information */
     cov_target.xsp = mc->xsp;
+	cov_target.xcx = mc->xcx;
     cov_target.func_pc = target_to_cov;
-    cov_target.cur_covlog = (char*)dr_global_alloc(MAXIMUM_PATH);
-    cov_target.log = NULL;
 
     debug_data.pre_handler_called++;
     if (options.debug_mode)
@@ -574,7 +715,7 @@ pre_fuzz_handler(void *wrapcxt, INOUT void **user_data)
         }
     } else {
         for(i = 0; i < options.num_fuz_args; i++) {
-            if(options.file_arg_index)
+            if(options.file_arg_index && options.corpus_list)
                 options.func_args[options.file_arg_index - 1] = g_filelist->file_name;
             if (options.debug_mode)
 			    dr_fprintf(winafl_data.log, "set arg(%d): 0x%x\n", i, options.func_args[i]);
@@ -582,22 +723,12 @@ pre_fuzz_handler(void *wrapcxt, INOUT void **user_data)
         }
     }
 
-    /* As soon as the target function is started, we should get the coverage log ready, otherwise, we might miss some BB */
-    // g_filelist pointer will be adjusted in post-callback function
-    cov_target.cur_input = g_filelist->file_name;
-
-    // Some safety check
-    DR_ASSERT_MSG(cov_target.cur_covlog != NULL, "Something wrong with coverage log dir");
-    DR_ASSERT_MSG(cov_target.cur_input != NULL, "Current input is empty");
-
-    // Get the coverage log filename ready and open it for witting
-    strncpy(cur_cov_log, get_cov_result_filenameA(cov_target.cur_input), MAXIMUM_PATH);
-    cov_target.log = drx_open_unique_file(options.covlogdir, cur_cov_log, "cov.result", DR_FILE_ALLOW_LARGE, cov_target.cur_covlog, MAXIMUM_PATH);
-
-    // Some safety check
-    DR_ASSERT_MSG(cov_target.log != INVALID_FILE, "Something wrong with coverage log");
-
-    dbgprint("%s:%d: Initialized covlog: %s\n", __FUNCTION__, __LINE__, cov_target.cur_covlog);
+	/*
+	* As soon as the target function is started, we should get the coverage log ready,
+	* otherwise, we might miss some BB
+	* g_filelist pointer will be adjusted in post-callback function
+	*/
+	helper_prepare_cov_log();
     memset(winafl_data.afl_area, 0, MAP_SIZE);
     winafl_data.previous_offset = 0;
 }
@@ -605,7 +736,6 @@ pre_fuzz_handler(void *wrapcxt, INOUT void **user_data)
 static void
 post_fuzz_handler(void *wrapcxt, void *user_data)
 {
-	//__debugbreak();
     DWORD num_written;
     dr_mcontext_t *mc = drwrap_get_mcontext(wrapcxt);
 	app_pc addr = drwrap_get_func(wrapcxt);
@@ -616,27 +746,33 @@ post_fuzz_handler(void *wrapcxt, void *user_data)
 
     cov_target.iteration++;
     if (cov_target.iteration == options.cov_iterations) {
-        dbgprint("%s:%d: Exit Winaflcov\n", __FUNCTION__, __LINE__);
+        DEBUG_PRINT("%s:%d: Exit Winaflcov\n", __FUNCTION__, __LINE__);
         dr_exit_process(0);
     }
 
-    // TODO: should we free the filename buffer stored in cur_input?
-    dbgprint("%s:%d: Free covlog & cur_input: %s (iter:%d, cov_iter: %d)\n", __FUNCTION__, __LINE__, cov_target.cur_covlog, cov_target.iteration, options.cov_iterations);
-    if (cov_target.cur_input != NULL)
-        dr_global_free(cov_target.cur_input, MAXIMUM_PATH);
-    if (cov_target.cur_covlog != NULL)
-        dr_global_free(cov_target.cur_covlog, MAXIMUM_PATH);
+	helper_next_cov_log();
 
-    cov_target.cur_input = NULL;
-    cov_target.cur_covlog = NULL;
+//#ifdef _WMP
+//	// Redirect execution only when we reach a threshold of same message event obtained from GetMessage
+//	if (g_BoolShouldProceed)
+//	{
+//		// Reset other variables
+//		prev_messageid = 0;
+//		g_BoolShouldProceed = false;
+//
+//		// Perform loop
+//		mc->xsp = cov_target.xsp;
+//		mc->xcx = cov_target.xcx;
+//		mc->pc = cov_target.func_pc;
+//		drwrap_redirect_execution(wrapcxt);
+//	}
+//
+//#else
+	mc->xsp = cov_target.xsp;
+	mc->xcx = cov_target.xcx;
+	mc->pc = cov_target.func_pc;
+	drwrap_redirect_execution(wrapcxt);
 
-    // Next input corpus
-    g_filelist = g_filelist->next;
-
-    mc->xsp = cov_target.xsp;
-    mc->pc = cov_target.func_pc;
-
-    drwrap_redirect_execution(wrapcxt);
 }
 
 static void
@@ -645,7 +781,6 @@ createfilew_interceptor(void *wrapcxt, INOUT void **user_data)
     wchar_t *filenamew = (wchar_t *)drwrap_get_arg(wrapcxt, 0);
     
     /* Replace "@@" with our corpus file */
-    //if ((wcscmp(filenamew, FILE_REP_PATTERN_W) == 0 || wcscmp(get_cov_result_filenameW(filenamew), FILE_REP_PATTERN_W) == 0) && g_filelist)
     if (filenamew && get_cov_result_filenameW(filenamew)[0] == L'@' && get_cov_result_filenameW(filenamew)[1] == L'@' && g_filelist)
     {
         *user_data = (wchar_t *)dr_global_alloc(UNICODE_MAX_PATH);
@@ -663,7 +798,10 @@ static void
 createfilew_interceptor_post(void *wrapcxt, void *user_data)
 {
     // Free the allocated buffer
-    dr_global_free(user_data, UNICODE_MAX_PATH);
+    if (user_data)
+        dr_global_free(user_data, UNICODE_MAX_PATH);
+
+    user_data = NULL;
 }
 
 static void
@@ -672,7 +810,6 @@ createfilea_interceptor(void *wrapcxt, INOUT void **user_data)
     char *filename = (char *)drwrap_get_arg(wrapcxt, 0);
 
     /* Replace "@@" with our corpus file */
-    //if ((strcmp(filename, FILE_REP_PATTERN_A) == 0 || strcmp(get_cov_result_filenameA(filename), FILE_REP_PATTERN_A) == 0) && g_filelist)
     if (filename && get_cov_result_filenameA(filename)[0] == '@' && get_cov_result_filenameA(filename)[1] == '@' && g_filelist)
     {
         drwrap_set_arg(wrapcxt, 0, g_filelist->file_name);
@@ -685,6 +822,93 @@ createfilea_interceptor(void *wrapcxt, INOUT void **user_data)
         dr_fprintf(winafl_data.log, "In OpenFileA, reading %s\n", filename);
 }
 
+static void
+messagebox_interceptor(void *wrapcxt, INOUT void **user_data)
+{
+    /* Always return IDOK */
+    //__debugbreak();
+    bool res = drwrap_skip_call(wrapcxt, (int *)IDOK, sizeof(void*) * 5);
+    if (options.debug_mode)
+        dr_fprintf(winafl_data.log, "Skipped MessageBoxExAorW\n");
+    DEBUG_PRINT("%s:%d: drwrap_skip_call: %d\n", __FUNCTION__, __LINE__, res);
+    
+}
+
+static void
+dialogboxidnirectparam_interceptor(void *wrapcxt, INOUT void **user_data)
+{
+    //__debugbreak();
+    bool res = drwrap_skip_call(wrapcxt, (int *)-1, sizeof(void*) * 6);
+    if (options.debug_mode)
+        dr_fprintf(winafl_data.log, "Skipped DialogBoxIndirectParamAorW\n");
+    DEBUG_PRINT("%s:%d: drwrap_skip_call: %d\n", __FUNCTION__, __LINE__, res);
+
+}
+
+static void
+getmessage_interceptor_pre(void *wrapcxt, INOUT void **user_data)
+{
+	MSG* msg = (MSG*)drwrap_get_arg(wrapcxt, 0);
+	*user_data = (MSG*)msg;
+}
+
+#define MAX_PARAMETER 32768
+static void
+helper_start_wmp()
+{
+
+		char szWMPlayer[MAX_PATH] = { 0 };
+		char szParameter[MAX_PARAMETER] = { 0 };
+		STARTUPINFOA si;
+		PROCESS_INFORMATION pi;
+		memset(&si, 0, sizeof(STARTUPINFOA));
+		memset(&pi, 0, sizeof(PROCESS_INFORMATION));
+		si.cb = sizeof(STARTUPINFOA);
+
+		ExpandEnvironmentStringsA("%PROGRAMFILES%\\Windows Media Player\\wmplayer.exe", szWMPlayer, MAX_PATH);
+		dr_snprintf(szParameter, BUFFER_SIZE_ELEMENTS(szParameter), "\"%s\" %s", szWMPlayer, cov_target.cur_input);
+		CreateProcessA(szWMPlayer, szParameter, NULL, NULL, FALSE, CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi);
+}
+
+static void
+getmessage_interceptor_post(void *wrapcxt, void *user_data)
+{
+	MSG* msg = (MSG*)user_data;
+
+	// Proceed only when GetMessage call is successful
+	if ((unsigned int)drwrap_get_retval(wrapcxt) != -1)
+	{
+		// Message we want to intercept so that we will proceed to the next input
+		DR_ASSERT_MSG(options.messageid[0] != -1, "Options message_id is empty");
+		if (msg != NULL)
+		{
+			if (cov_target.iteration == options.cov_iterations) {
+				DEBUG_PRINT("%s:%d: Finished %d iteration\n", __FUNCTION__, __LINE__, options.cov_iterations);
+				dr_exit_process(0);
+			}
+
+			DEBUG_PRINT("%s:%d: Message: 0x%x\n", __FUNCTION__, __LINE__, msg->message);
+
+			for (int i = 0; i < MAXIMUM_MESSAGE_IDS; i++)
+			{
+				if (msg->message == options.messageid[i])
+				{
+					helper_prepare_cov_log();
+				}
+			}
+
+			if (start_instru_ms > 0 && get_cur_time() > start_instru_ms + g_WaitTimeMs)
+			{
+				DEBUG_PRINT("%s:%d: Threshold met\n", __FUNCTION__, __LINE__);
+				start_instru_ms = 0;
+				helper_start_wmp();
+				helper_next_cov_log();
+				cov_target.iteration++;
+			}
+
+		}
+	}
+}
 
 static void
 event_module_unload(void *drcontext, const module_data_t *info)
@@ -703,7 +927,7 @@ event_module_load(void *drcontext, const module_data_t *info, bool loaded)
     dr_fprintf(winafl_data.log, "#%d Module loaded, %s, Loaded address: 0x%x\n", mod_index, module_name, info->start);
 
     if(options.fuzz_module[0]) {
-        if(strcmp(module_name, options.fuzz_module) == 0) {
+        if(_stricmp(module_name, options.fuzz_module) == 0) {
             if(options.fuzz_offset) {
                 to_wrap = info->start + options.fuzz_offset;
             } else {
@@ -713,11 +937,24 @@ event_module_load(void *drcontext, const module_data_t *info, bool loaded)
             drwrap_wrap(to_wrap, pre_fuzz_handler, post_fuzz_handler);
         }
     
-        if(strcmp(module_name, "KERNEL32.dll") == 0) {
+        if(_stricmp(module_name, "KERNEL32.dll") == 0) {
             to_wrap = (app_pc)dr_get_proc_address(info->handle, "CreateFileW");
             drwrap_wrap(to_wrap, createfilew_interceptor, createfilew_interceptor_post);
             to_wrap = (app_pc)dr_get_proc_address(info->handle, "CreateFileA");
             drwrap_wrap(to_wrap, createfilea_interceptor, NULL);
+        }
+
+        if (_stricmp(module_name, "USER32.dll") == 0) {
+            to_wrap = (app_pc)dr_get_proc_address(info->handle, "MessageBoxExW");
+            drwrap_wrap(to_wrap, messagebox_interceptor, NULL);
+            to_wrap = (app_pc)dr_get_proc_address(info->handle, "MessageBoxExA");
+            drwrap_wrap(to_wrap, messagebox_interceptor, NULL);
+            to_wrap = (app_pc)dr_get_proc_address(info->handle, "DialogBoxIndirectParamAorW");
+            drwrap_wrap(to_wrap, dialogboxidnirectparam_interceptor, NULL);
+#ifdef _WMP
+			to_wrap = (app_pc)dr_get_proc_address(info->handle, "GetMessageW");
+			drwrap_wrap(to_wrap, getmessage_interceptor_pre, getmessage_interceptor_post);
+#endif
         }
     }
 
@@ -726,10 +963,14 @@ event_module_load(void *drcontext, const module_data_t *info, bool loaded)
         target_module_t *target_module = options.target_modules;
         while (target_module)
         {   
-            if (strcmp(module_name, target_module->module_name))
+            if (_stricmp(module_name, target_module->module_name))
             {
                 target_module->mod_id = mod_index;
-                target_module->base = info->start;
+#ifdef _WIN64
+                target_module->base = (uint64_t)info->start;
+#else
+                target_module->base = (uint)info->start;
+#endif
                 break;
             }
             target_module = target_module->next;
@@ -745,24 +986,23 @@ event_module_load(void *drcontext, const module_data_t *info, bool loaded)
 static void
 event_exit(void)
 {
-    if(options.debug_mode) {
-        if (debug_data.pre_handler_called == 0) {
-            dr_fprintf(winafl_data.log, "WARNING: Target function was never called. Incorrect target_offset?\n");
-        } else if(debug_data.post_handler_called == 0) {
-            dr_fprintf(winafl_data.log, "WARNING: Post-fuzz handler was never reached. Did the target function return normally?\n");
-        } else {
-            dr_fprintf(winafl_data.log, "Everything appears to be running normally.\n");            
-        }
-
-        // dr_fprintf(winafl_data.log, "Coverage map follows:\n");
-        //dump_winafl_data();
+    if (debug_data.pre_handler_called == 0) {
+        dr_fprintf(winafl_data.log, "WARNING: Target function was never called. Incorrect target_offset?\n");
     }
+    else if (debug_data.post_handler_called == 0) {
+        dr_fprintf(winafl_data.log, "WARNING: Post-fuzz handler was never reached. Did the target function return normally?\n");
+    }
+    else {
+        dr_fprintf(winafl_data.log, "Everything appears to be running normally.\n");
+    }
+
+    // dr_fprintf(winafl_data.log, "Coverage map follows:\n");
+    //dump_winafl_data();
 
     /* destroy module table */
     module_table_destroy(module_table);
 
     /* Show elapsed time */
-    time_t timer;
     double elapsed;
     end_time = time(NULL);
     elapsed = difftime(end_time, start_time);
@@ -796,7 +1036,7 @@ event_init(void)
         debug_data.post_handler_called = 0;
 
         winafl_data.log =
-            drx_open_unique_appid_file(options.logdir, dr_get_process_id(),
+            drx_open_unique_appid_file(options.logdir, get_parent_pid(),
                                    "winaflcov", "proc.log",
                                    DR_FILE_ALLOW_LARGE,
                                    buf, BUFFER_SIZE_ELEMENTS(buf));
@@ -808,8 +1048,7 @@ event_init(void)
 
     /* Coverage target initialization */
     cov_target.iteration = 0;
-    cov_target.cur_covlog = NULL;
-    cov_target.cur_covlog = NULL;
+    cov_target.cur_covlog = NULL;    
     cov_target.log = NULL;
 }
 
@@ -866,10 +1105,14 @@ options_init(client_id_t id, int argc, const char *argv[])
     options.fuzz_module[0] = 0;
     options.fuzz_method[0] = 0;
     options.fuzz_offset = 0;
-    options.cov_iterations = 100;
+#ifdef _WMP
+	options.messageid[0] = -1;
+#endif
+    options.cov_iterations = 1;
     options.func_args = NULL;
     options.file_arg_index = 0;
     options.num_fuz_args = 0;
+	options.single_test_case = false;
     dr_snprintf(options.logdir, BUFFER_SIZE_ELEMENTS(options.logdir), ".");
     dr_snprintf(options.covlogdir, BUFFER_SIZE_ELEMENTS(options.covlogdir), ".");
 
@@ -913,6 +1156,7 @@ options_init(client_id_t id, int argc, const char *argv[])
             options.target_modules = (target_module_t *)dr_global_alloc(sizeof(target_module_t));
             options.target_modules->next = target_modules;
             strncpy(options.target_modules->module_name, argv[++i], BUFFER_SIZE_ELEMENTS(options.target_modules->module_name));
+            options.target_modules->marked_to_log = false;
         }
         else if (strcmp(token, "-target_module") == 0) {
             USAGE_CHECK((i + 1) < argc, "missing module");
@@ -930,6 +1174,10 @@ options_init(client_id_t id, int argc, const char *argv[])
             USAGE_CHECK((i + 1) < argc, "missing offset");
             options.fuzz_offset = strtoul(argv[++i], NULL, 0);
         }
+        else if (strcmp(token, "-cov_iterations") == 0) {
+            USAGE_CHECK((i + 1) < argc, "missing number of iterations");
+            options.cov_iterations = atoi(argv[++i]);
+        }
         else if (strcmp(token, "-verbose") == 0) {
             USAGE_CHECK((i + 1) < argc, "missing -verbose number");
             token = argv[++i];
@@ -940,6 +1188,57 @@ options_init(client_id_t id, int argc, const char *argv[])
         else if (strcmp(token, "-file_arg_index") == 0) {
             USAGE_CHECK((i + 1) < argc, "missing -file_arg_index number");
             options.file_arg_index = atoi(argv[++i]);
+        }
+#ifdef _WMP
+		else if (strcmp(token, "-message_id") == 0) {
+			USAGE_CHECK((i + 1) < argc, "missing -message_id");
+			/*
+			*	A message id is typically used by event-based GUI software
+			*	You can select a message id that will trigger the file to be parsed
+			*   You can specify more than one message id using comma (",") as separator
+			*	(For example: On Windows Media Player, WMI_TIMER (0x8000) is triggered
+			*                 continuously)
+			*/
+			int size = strlen(argv[i+1]);
+			char *msg_ids = (char*)dr_global_alloc(size);
+			strncpy(msg_ids, argv[i+1], size);
+			char *p = msg_ids, *start_s = msg_ids;
+			int id = 0;
+			if (strrchr(msg_ids, ',') != NULL)
+			{
+				while (1)
+				{
+					if (*p == ',' || *p == '\0')
+					{
+						*p = '\0';
+						options.messageid[id] = atoi(start_s);
+						// Set the start string to next p
+						start_s = p + 1;
+						id++;
+					}
+
+					if (p++ >= (msg_ids + size + 1))
+						break;
+				}
+			}
+			else
+			{
+				options.messageid[id] = atoi(start_s);
+			}
+			__debugbreak();
+			dr_global_free(msg_ids, size);
+			i++;
+		}
+#endif
+        else if (strcmp(token, "-single_test_case") == 0) {
+            USAGE_CHECK((i + 1) < argc, "missing -single_test_case file path");
+            /*
+            *  A single test case should be used to perform code coverage
+            */
+            g_filelist = (file_list_t *)dr_global_alloc(sizeof(file_list_t));
+            strncpy(g_filelist->file_name, argv[++i], BUFFER_SIZE_ELEMENTS(g_filelist->file_name));
+            g_filelist->next = NULL;
+			options.single_test_case = true;
         }
         else if (strcmp(token, "-list_input") == 0) {
             USAGE_CHECK((i + 1) < argc, "missing input corpus");
@@ -961,6 +1260,7 @@ options_init(client_id_t id, int argc, const char *argv[])
                     break;
                 tmpplist = plist = plist + 1;
             }
+			options.single_test_case = false;
             dr_global_free(list_input, size);
 
             // The number of coverage depends on the number of input corpus
@@ -975,6 +1275,9 @@ options_init(client_id_t id, int argc, const char *argv[])
     if(options.fuzz_module[0] && (options.fuzz_offset == 0) && (options.fuzz_method[0] == 0)) {
        USAGE_CHECK(false, "If fuzz_module is specified, then either fuzz_method or fuzz_offset must be as well");
     }
+
+	if ((options.single_test_case && options.corpus_list != NULL))
+		USAGE_CHECK(false, "-single_test_case and -list_input should be mutual exclusive");
 
     if(options.num_fuz_args) {
         options.func_args = (void **)dr_global_alloc(options.num_fuz_args * sizeof(void *));
@@ -998,7 +1301,7 @@ static void filelist_init()
         // Simple sanity check to make sure we are enumerating folder
         if (!dr_directory_exists(input_corpus->dir_name))
         {
-            dbgprint("%s:%d: It's not directory: %s\n", __FUNCTION__, __LINE__, input_corpus->dir_name);
+            DEBUG_PRINT("%s:%d: It's not directory: %s\n", __FUNCTION__, __LINE__, input_corpus->dir_name);
             dr_exit_process(0);
         }
 
@@ -1030,7 +1333,7 @@ static void filelist_init()
 
             if (hFind == INVALID_HANDLE_VALUE)
             {
-                dbgprint("%s:%d: Failed to open directory: %s (0x%d)\n", __FUNCTION__, __LINE__, input_corpus->dir_name, GetLastError());
+                DEBUG_PRINT("%s:%d: Failed to open directory: %s (0x%d)\n", __FUNCTION__, __LINE__, input_corpus->dir_name, GetLastError());
                 dr_exit_process(0);
             }
 
@@ -1045,7 +1348,7 @@ static void filelist_init()
                     strncpy(test_case->file_name, input_corpus->dir_name, MAXIMUM_PATH);
                     strcat(test_case->file_name, "\\");
                     strcat(test_case->file_name, ffd.cFileName);
-                    dbgprint("%s:%d: Filename: %s\n", __FUNCTION__, __LINE__, test_case->file_name);
+                    DEBUG_PRINT("%s:%d: Filename: %s\n", __FUNCTION__, __LINE__, test_case->file_name);
                     // Number of coverage to be run depends on the number of input corpus
                     options.cov_iterations++;
                 }
@@ -1058,7 +1361,7 @@ static void filelist_init()
         input_corpus->processed_dir = true;
         input_corpus = input_corpus->next;
     }
-    dbgprint("%s:%d: g_fiellist: 0x%x\n", __FUNCTION__, __LINE__, g_filelist);
+    DEBUG_PRINT("%s:%d: g_fiellist: 0x%x\n", __FUNCTION__, __LINE__, g_filelist);
     //options.cov_iterations--;
 }
 
