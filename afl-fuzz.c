@@ -61,7 +61,9 @@ limitations under the License.
 #  include <sys/sysctl.h>
 #endif /* __APPLE__ || __FreeBSD__ || __OpenBSD__ */
 
-
+#if defined(_WMP)
+#define WMP_BUFF_RUN_TIME 1000
+#endif
 /* Lots of globals, but mostly for the status UI and other things where it
 really makes no sense to haul them around as function parameters. */
 
@@ -105,7 +107,7 @@ qemu_mode,                 /* Running in QEMU mode?            */
 skip_requested,            /* Skip request, via SIGUSR1        */
 run_over10m;               /* Run time over 10 minutes?        */
 
-static s32 out_fd,                    /* Persistent fd for out_file       */
+static s32 out_fd,         /* Persistent fd for out_file       */
 dev_urandom_fd = -1,       /* Persistent fd for /dev/urandom   */
 dev_null_fd = -1,          /* Persistent fd for /dev/null      */
 fsrv_ctl_fd,               /* Fork server control pipe (write) */
@@ -254,6 +256,7 @@ static struct extra_data* a_extras;   /* Automatically selected extras    */
 static u32 a_extras_cnt;              /* Total number of tokens available */
 
 static u8* (*post_handler)(u8* buf, u32* len);
+static u8 delete_files(u8* path, u8* prefix);
 
 /* Interesting values, as per config.h */
 
@@ -301,7 +304,6 @@ enum {
 	/* 04 */ FAULT_NOINST,
 	/* 05 */ FAULT_NOBITS
 };
-
 
 /* Get unix time in milliseconds */
 
@@ -2044,7 +2046,6 @@ static void create_target_process(char** argv) {
 	PROCESS_INFORMATION pi;
 
 	pipe_name = (char *)alloc_printf("\\\\.\\pipe\\afl_pipe_%s", fuzzer_id);
-
 	pipe_handle = CreateNamedPipe(
 		pipe_name,                // pipe name
 		PIPE_ACCESS_DUPLEX,       // read/write access
@@ -2080,7 +2081,7 @@ static void create_target_process(char** argv) {
 		inherit_handles = FALSE;
 	}
 
-	if (!CreateProcess(NULL, dr_cmd, NULL, NULL, inherit_handles, /*CREATE_NO_WINDOW*/0, NULL, NULL, &si, &pi)) {
+	if (!CreateProcess(NULL, dr_cmd, NULL, NULL, inherit_handles, /*CREATE_NO_WINDOW*//*CREATE_NEW_CONSOLE*/0, NULL, NULL, &si, &pi)) {
 		FATAL("CreateProcess failed, GLE=%d.\n", GetLastError());
 	}
 
@@ -2181,11 +2182,21 @@ static void destroy_target_process(int wait_exit) {
 
 	//close the pipe
 	if (pipe_handle) {
-		DisconnectNamedPipe(pipe_handle);
+		if (!DisconnectNamedPipe(pipe_handle))
+			FATAL("DisconnectNamedPipe failed, GLE=%d.\n", GetLastError());
 		CloseHandle(pipe_handle);
 
 		pipe_handle = NULL;
 	}
+
+//#ifdef _WMP
+//	u8 localappdata[MAX_PATH];
+//	u8 *fn;
+//	ExpandEnvironmentStringsA("%LOCALAPPDATA%", localappdata, MAX_PATH);
+//	fn = alloc_printf("%s\\Microsoft\\Media Player", localappdata);
+//	delete_files(fn, "CurrentDatabase_");
+//	ck_free(fn);
+//#endif
 
 	LeaveCriticalSection(&critical_section);
 }
@@ -2208,6 +2219,7 @@ static void setup_watchdog_timer() {
 }
 
 static int is_child_running() {
+	//printf("%s:%d child_handle: 0x%x\n", __FUNCTION__, __LINE__, child_handle);
 	return (child_handle && (WaitForSingleObject(child_handle, 0) == WAIT_TIMEOUT));
 }
 
@@ -2238,6 +2250,7 @@ static u8 run_target(char** argv) {
 
 	if (!is_child_running()) {
 		destroy_target_process(0);
+		printf("%s:%d No child running, call create_target_process\n", __FUNCTION__, __LINE__);
 		create_target_process(argv);
 		fuzz_iterations_current = 0;
 	}
@@ -2245,6 +2258,7 @@ static u8 run_target(char** argv) {
 	child_timed_out = 0;
 	memset(trace_bits, 0, MAP_SIZE);
 
+	printf("%s:%d Sending command to winafl: %s\n", __FUNCTION__, __LINE__, command);
 	WriteFile(
 		pipe_handle,        // handle to pipe 
 		command,     // buffer to write from 
@@ -2257,7 +2271,7 @@ static u8 run_target(char** argv) {
 	watchdog_enabled = 1;
 
 	ReadFile(pipe_handle, &result, 1, &num_read, NULL);
-
+	printf("%s:%d Read command from winafl: %c\n", __FUNCTION__, __LINE__, result);
 	watchdog_enabled = 0;
 
 	total_execs++;
@@ -2280,22 +2294,29 @@ static u8 run_target(char** argv) {
 	return FAULT_HANG;
 }
 
-
 /* Write modified data to file for testing. If out_file is set, the old file
 is unlinked and a new one is created. Otherwise, out_fd is rewound and
 truncated. */
 
 static void write_to_testcase(void* mem, u32 len) {
 
+	OutputDebugStringA("enter write_to_testcase\n");
 	s32 fd = out_fd;
 
+//#ifdef _WMP
+//	Sleep(WMP_BUFF_RUN_TIME); /* Give some buffer time for dummy WMV to run so the fd will be closed */
+//	OutputDebugStringA("write_to_testcase: Slept X seconds\n");
+//#endif
 	if (out_file) {
-
+		OutputDebugStringA("write_to_testcase: Unlinking out_file...\n");
 		unlink(out_file); /* Ignore errors. */
-
+		OutputDebugStringA("write_to_testcase: opening fd...\n");
 		fd = open(out_file, O_WRONLY | O_BINARY | O_CREAT | O_EXCL, 0600);
-
+		OutputDebugStringA("write_to_testcase: opened fd\n");
 		if (fd < 0) {
+			OutputDebugStringA("write_to_testcase: fd failed\n");
+			printf("%s:%d: fd failed\n", __FUNCTION__, __LINE__);
+
 			destroy_target_process(0);
 
 			unlink(out_file); /* Ignore errors. */
@@ -2310,7 +2331,7 @@ static void write_to_testcase(void* mem, u32 len) {
 	else lseek(fd, 0, SEEK_SET);
 
 	ck_write(fd, mem, len, out_file);
-
+	OutputDebugStringA("write_to_testcase: Done ck_write\n");
 	if (!out_file) {
 
 		if (_chsize(fd, len)) PFATAL("ftruncate() failed");
@@ -2319,6 +2340,7 @@ static void write_to_testcase(void* mem, u32 len) {
 	}
 	else close(fd);
 
+	OutputDebugStringA("Done write_to_testcase\n");
 }
 
 
@@ -2326,16 +2348,24 @@ static void write_to_testcase(void* mem, u32 len) {
 
 static void write_with_gap(char* mem, u32 len, u32 skip_at, u32 skip_len) {
 
+	OutputDebugStringA("enter write_with_gap\n");
 	s32 fd = out_fd;
 	u32 tail_len = len - skip_at - skip_len;
-
+//#ifdef _WMP
+//	Sleep(WMP_BUFF_RUN_TIME); /* Give some buffer time for dummy WMV to run so the fd will be closed */
+//	OutputDebugStringA("write_with_gap: Slept X seconds\n");
+//#endif
 	if (out_file) {
 
+		OutputDebugStringA("write_with_gap: Unlinking out_file...\n");
 		unlink(out_file); /* Ignore errors. */
+		OutputDebugStringA("write_with_gap: opening fd...\n");
 
 		fd = open(out_file, O_WRONLY | O_BINARY | O_CREAT | O_EXCL, 0600);
-
+		OutputDebugStringA("write_with_gap: opened fd\n");
 		if (fd < 0) {
+			OutputDebugStringA("write_with_gap: fd failed\n");
+			printf("%s:%d: fd failed\n", __FUNCTION__, __LINE__);
 			destroy_target_process(0);
 
 			unlink(out_file); /* Ignore errors. */
@@ -2351,7 +2381,7 @@ static void write_with_gap(char* mem, u32 len, u32 skip_at, u32 skip_len) {
 	if (skip_at) ck_write(fd, mem, skip_at, out_file);
 
 	if (tail_len) ck_write(fd, mem + skip_at + skip_len, tail_len, out_file);
-
+	OutputDebugStringA("write_with_gap: Done ck_write\n");
 	if (!out_file) {
 
 		if (_chsize(fd, len - skip_len)) PFATAL("ftruncate() failed");
@@ -2359,7 +2389,7 @@ static void write_with_gap(char* mem, u32 len, u32 skip_at, u32 skip_len) {
 
 	}
 	else close(fd);
-
+	OutputDebugStringA("Done write_with_gap\n");
 }
 
 
@@ -2403,7 +2433,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
 		if (!first_run && !(stage_cur % stats_update_freq)) show_stats();
 
 		write_to_testcase(use_mem, q->len);
-
+		printf("%s:%d: Stage #: %d/%d\n", __FUNCTION__, __LINE__, stage_cur, stage_max);
 		fault = run_target(argv);
 
 		/* stop_soon is set by the handler for Ctrl+C. When it's pressed,
@@ -2427,6 +2457,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
 
 				var_detected = 1;
 				stage_max = CAL_CYCLES_LONG;
+				//stage_max = 10;
 
 			}
 			else q->exec_cksum = cksum;
@@ -2434,7 +2465,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
 		}
 
 	}
-
+	printf("%s:%d: calibration_stage completed\n", __FUNCTION__, __LINE__);
 	stop_us = get_cur_time_us();
 
 	total_cal_us += stop_us - start_us;
@@ -2531,6 +2562,8 @@ static void perform_dry_run(char** argv) {
 		close(fd);
 
 		res = calibrate_case(argv, q, use_mem, 0, 1);
+		printf("%s:%d: Done calibrate_case in perform_dry_run, result = %d\n", __FUNCTION__, __LINE__, res);
+		
 		ck_free(use_mem);
 
 		if (stop_soon) return;
@@ -3570,8 +3603,8 @@ static void maybe_delete_out_dir(void) {
 	ck_free(fn);
 
 	/* And now, for some finishing touches. */
-
 	fn = alloc_printf("%s\\.cur_input", out_dir);
+
 	if (unlink(fn) && errno != ENOENT) goto dir_cleanup_failed;
 	ck_free(fn);
 
@@ -6720,7 +6753,6 @@ static void setup_dirs_fds(void) {
 /* Setup the output file for fuzzed data, if not using -f. */
 
 static void setup_stdio_file(void) {
-
 	u8* fn = alloc_printf("%s\\.cur_input", out_dir);
 
 	unlink(fn); /* Ignore errors */
@@ -7021,6 +7053,7 @@ static void detect_file_args(char** argv) {
 
 			if (!out_file)
 				out_file = alloc_printf("%s\\.cur_input", out_dir);
+
 
 			/* Be sure that we're always using fully-qualified paths. */
 
@@ -7455,6 +7488,8 @@ int main(int argc, char** argv) {
 		use_argv = argv + optind;
 
 	perform_dry_run(use_argv);
+
+	//_putenv_s("AFL_DRYRUN_COMPLETE", "1");
 
 	cull_queue();
 

@@ -46,6 +46,47 @@ static uint verbose;
         dr_fprintf(STDERR, fmt, __VA_ARGS__); \
 } while (0)
 
+void dbgprint(char *fmt, ...)
+{
+	do {
+		va_list arg;
+		char buffer[4096] = { 0 };
+
+		va_start(arg, fmt);
+		dr_vsnprintf(buffer, 4096, fmt, arg);
+		va_end(arg);
+
+		OutputDebugStringA(buffer);
+	} while (0);
+}
+
+void __forceinline dbgbreak(void)
+{
+	__debugbreak();
+}
+
+#ifdef _DEBUG
+#define DEBUG_PRINT dbgprint        
+#define DEBUG_BREAK dbgbreak
+#else 
+#define DEBUG_PRINT
+#define DEBUG_BREAK __nop
+#endif
+
+// Make it optional for GUI-based software (eg: Microsoft Office or Windows Media Player)
+#ifdef _WMP
+#define MAXIMUM_MESSAGE_IDS 256
+BOOL	g_BoolFirstRun = true;
+/*	Maximum wait time (ms) for the next input iteration.
+*	Must be smaller than client time-out value specified
+*	in afl-fuzz CreateNamePipe function and also exec_tmout
+*	(using -t option)
+*/
+UINT	g_WaitTimeMs = 20000;
+// This is a maximum count of continuous message id hit by GetMessage API
+int		g_MaxCountMessageIdOccurred = 1000;
+#endif
+
 #define OPTION_MAX_LENGTH MAXIMUM_PATH
 
 #define COVERAGE_BB 0
@@ -74,6 +115,10 @@ typedef struct _winafl_option_t {
     int fuzz_iterations;
     void **func_args;
     int num_fuz_args;
+#ifdef _WMP
+	unsigned long timeout;
+	int messageid[MAXIMUM_MESSAGE_IDS];
+#endif
 } winafl_option_t;
 static winafl_option_t options;
 
@@ -96,6 +141,7 @@ typedef struct _fuzz_target_t {
     reg_t xsp;            /* stack level at entry to the fuzz target */
 	reg_t xcx;
     app_pc func_pc;
+	char *cur_input;
     int iteration;
 } fuzz_target_t;
 static fuzz_target_t fuzz_target;
@@ -118,6 +164,22 @@ static void
 event_thread_exit(void *drcontext);
 
 static HANDLE pipe;
+
+/****************************************************************************
+* Helper functions
+*/
+/* Get current time in milliseconds */
+static uint64 get_cur_time(void) {
+
+	uint64 ret;
+	FILETIME filetime;
+	GetSystemTimeAsFileTime(&filetime);
+
+	ret = (((uint64)filetime.dwHighDateTime) << 32) + (uint64)filetime.dwLowDateTime;
+
+	return ret / 10000;
+
+}
 
 /****************************************************************************
  * Nudges
@@ -184,7 +246,8 @@ onexception(void *drcontext, dr_exception_t *excpt) {
        (exception_code == EXCEPTION_ILLEGAL_INSTRUCTION) ||
        (exception_code == EXCEPTION_PRIV_INSTRUCTION) ||
        (exception_code == EXCEPTION_STACK_OVERFLOW)) {
-		//__debugbreak();
+		DEBUG_BREAK();
+		dr_fprintf(winafl_data.log, "crashed at %08x\n", excpt->mcontext->pc);
           if(options.debug_mode)
             dr_fprintf(winafl_data.log, "crashed\n");
           if(!options.debug_mode)
@@ -194,6 +257,31 @@ onexception(void *drcontext, dr_exception_t *excpt) {
     return true;
 }
 
+static dr_emit_flags_t
+analysis_bb_coverage(void *drcontext, void *tag, instrlist_t *bb,
+					 bool for_trace, bool translating, OUT void **user_data)
+{
+	instr_t *instr;
+	app_pc start_pc;
+	int cur_size = 0;
+
+	if (translating)
+		return DR_EMIT_DEFAULT;
+
+	start_pc = dr_fragment_app_pc(tag);
+
+	for (instr = instrlist_first_app(bb);
+		instr != NULL;
+		instr = instr_get_next_app(instr))
+		cur_size++;
+
+
+	return DR_EMIT_DEFAULT;
+}
+
+#ifdef _WMP
+uint64 start_instru_ms = 0; /* A time to indicate when the last instrumentation was started (ms) */
+#endif
 static dr_emit_flags_t
 instrument_bb_coverage(void *drcontext, void *tag, instrlist_t *bb, instr_t *inst,
                       bool for_trace, bool translating, void *user_data)
@@ -232,7 +320,15 @@ instrument_bb_coverage(void *drcontext, void *tag, instrlist_t *bb, instr_t *ins
     }
     if(!should_instrument) return DR_EMIT_DEFAULT;
 
-	//__debugbreak();	// Never hit here in debug mode?
+#ifdef _WMP
+	/*
+	*  Get the start time of the instrumentation
+	*  that can be used to determine if we should start
+	*  next input
+	*/
+	//start_instru_ms = get_cur_time();
+#endif
+
     offset = (uint)(start_pc - mod_entry->data->start);
     offset &= MAP_SIZE - 1;
     
@@ -244,6 +340,7 @@ instrument_bb_coverage(void *drcontext, void *tag, instrlist_t *bb, instr_t *ins
 
     drreg_unreserve_aflags(drcontext, bb, inst);
 
+	//DEBUG_PRINT("%s:%d Post BB hit at block %08x\n", __FUNCTION__, __LINE__, start_pc);
     return DR_EMIT_DEFAULT;
 }
 
@@ -290,6 +387,15 @@ instrument_edge_coverage(void *drcontext, void *tag, instrlist_t *bb, instr_t *i
         target_modules = target_modules->next;
     }
     if(!should_instrument) return DR_EMIT_DEFAULT;
+
+#ifdef _WMP
+	/*
+	*  Get the start time of the instrumentation
+	*  that can be used to determine if we should start
+	*  next input
+	*/
+	//start_instru_ms = get_cur_time();
+#endif
 
     offset = (uint)(start_pc - mod_entry->data->start);
     offset &= MAP_SIZE - 1;
@@ -370,7 +476,6 @@ instrument_edge_coverage(void *drcontext, void *tag, instrlist_t *bb, instr_t *i
 static void
 pre_fuzz_handler(void *wrapcxt, INOUT void **user_data)
 {
-	//__debugbreak();
     char command = 0;
     int i;
     DWORD num_read;
@@ -417,7 +522,6 @@ pre_fuzz_handler(void *wrapcxt, INOUT void **user_data)
 static void
 post_fuzz_handler(void *wrapcxt, void *user_data)
 {
-	//__debugbreak();
     DWORD num_written;
     dr_mcontext_t *mc = drwrap_get_mcontext(wrapcxt);
 	app_pc addr = drwrap_get_func(wrapcxt);
@@ -458,6 +562,227 @@ createfilea_interceptor(void *wrapcxt, INOUT void **user_data)
         dr_fprintf(winafl_data.log, "In OpenFileA, reading %s\n", filename);
 }
 
+#ifdef _WMP
+static void
+messagebox_interceptor(void *wrapcxt, INOUT void **user_data)
+{
+	/* Always return IDOK */
+	bool res = drwrap_skip_call(wrapcxt, (int *)IDOK, sizeof(void*) * 5);
+	if (options.debug_mode)
+		dr_fprintf(winafl_data.log, "Skipped MessageBoxExAorW\n");
+	DEBUG_PRINT("%s:%d: drwrap_skip_call: %d\n", __FUNCTION__, __LINE__, res);
+
+}
+
+static void
+dialogboxidnirectparam_interceptor(void *wrapcxt, INOUT void **user_data)
+{
+	bool res = drwrap_skip_call(wrapcxt, (int *)-1, sizeof(void*) * 6);
+	if (options.debug_mode)
+		dr_fprintf(winafl_data.log, "Skipped DialogBoxIndirectParamAorW\n");
+	DEBUG_PRINT("%s:%d: drwrap_skip_call: %d\n", __FUNCTION__, __LINE__, res);
+
+}
+
+static void
+helper_start_wmp()
+{
+	/*char szWMPlayerPath[MAX_PATH] = { 0 };
+	char szWMPlayer[MAX_PATH] = { 0 };
+	char szParameter[MAX_PARAMETER] = { 0 };
+	char *command = NULL;
+
+	STARTUPINFOA si;
+	PROCESS_INFORMATION pi;
+	memset(&si, 0, sizeof(STARTUPINFOA));
+	memset(&pi, 0, sizeof(PROCESS_INFORMATION));
+	si.cb = sizeof(STARTUPINFOA);*/
+
+	//ExpandEnvironmentStringsA("%PROGRAMFILES%\\Windows Media Player", szWMPlayerPath, MAX_PATH);
+	//dr_snprintf(szWMPlayer, MAX_PATH, "%s\\wmplayer.exe", szWMPlayerPath);
+	//ExpandEnvironmentStringsA("%PROGRAMFILES%\\Windows Media Player\\wmplayer.exe", szWMPlayer, MAX_PATH);
+	//dr_snprintf(szParameter, BUFFER_SIZE_ELEMENTS(szParameter), "\"%s\" %s", szWMPlayer, fuzz_target.cur_input);
+	//CreateProcessA(szWMPlayer, szParameter, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
+	//ShellExecuteA(NULL, "open", szWMPlayer, szParameter, szWMPlayerPath, SW_SHOW);
+	HANDLE hWMPPipe = NULL;
+
+	while (1)
+	{
+		hWMPPipe = CreateFile(
+			"\\\\.\\pipe\\pipecreatewmp",   // WMP pipe name 
+			GENERIC_READ |                  // read and write access 
+			GENERIC_WRITE,
+			0,                              // no sharing 
+			NULL,                           // default security attributes
+			OPEN_EXISTING,                  // opens existing pipe 
+			0,                              // default attributes 
+			NULL);                          // no template file 
+
+		if (GetLastError() == ERROR_PIPE_BUSY)
+		{
+			DEBUG_PRINT("%s:%d: All pipe instances are busy, wait for 1 second\n", __FUNCTION__, __LINE__);
+			if (!WaitNamedPipeA("\\\\.\\pipe\\pipecreatewmp", 1000))
+				DR_ASSERT_MSG(false, "helper_start_wmp: could not open pipe after waiting for 1 second\n");
+
+		}
+		else
+			break;
+	}
+
+	if (hWMPPipe == INVALID_HANDLE_VALUE)
+		DR_ASSERT_MSG(false, "helper_start_wmp failed\n");
+
+	WriteFile(hWMPPipe, fuzz_target.cur_input, strlen(fuzz_target.cur_input), NULL, NULL);
+	CloseHandle(hWMPPipe);
+}
+
+static void start_dummy_wmp()
+{
+	HANDLE hWMPPipe = NULL;
+
+	hWMPPipe = CreateFile(
+		"\\\\.\\pipe\\pipecreatewmp",   // WMP pipe name 
+		GENERIC_READ |                  // read and write access 
+		GENERIC_WRITE,
+		0,                              // no sharing 
+		NULL,                           // default security attributes
+		OPEN_EXISTING,                  // opens existing pipe 
+		0,                              // default attributes 
+		NULL);                          // no template file 
+
+	if (hWMPPipe == INVALID_HANDLE_VALUE)
+		DR_ASSERT_MSG(false, "start_dummy_wmp failed\n");
+
+	WriteFile(hWMPPipe, "c:\\dummy.wmv", strlen("c:\\dummy.wmv"), NULL, NULL);
+	CloseHandle(hWMPPipe);
+}
+
+static void
+getmessage_interceptor_pre(void *wrapcxt, INOUT void **user_data)
+{
+	MSG* msg = (MSG*)drwrap_get_arg(wrapcxt, 0);
+	*user_data = (MSG*)msg;
+}
+
+bool g_DummyWMPCalled = false;
+static void
+getmessage_interceptor_post(void *wrapcxt, void *user_data)
+{
+	MSG* msg = (MSG*)user_data;
+	
+	/*if (getenv("AFL_WRITE_LOCK") && atoi(getenv("AFL_WRITE_LOCK")))
+		return;*/
+
+	// Proceed only when GetMessage call is successful
+	if ((unsigned int)drwrap_get_retval(wrapcxt) != -1)
+	{
+		// Message we want to intercept so that we will proceed to the next input
+		DR_ASSERT_MSG(options.messageid[0] != -1, "Options message_id is empty");
+		if (msg != NULL)
+		{
+			if (fuzz_target.iteration == options.fuzz_iterations)
+			{
+				DEBUG_PRINT("%s:%d: Finished %d iteration\n", __FUNCTION__, __LINE__, options.fuzz_iterations);
+				dr_exit_process(0);
+			}
+
+			DEBUG_PRINT("%s:%d: Message: 0x%x\n", __FUNCTION__, __LINE__, msg->message);
+			for (int i = 0; i < MAXIMUM_MESSAGE_IDS; i++)
+			{
+				//if (msg->message == 0x8001)
+				//{
+				//	//
+				//	// 3. Now we proceed to next input test case
+				//	//
+				//	if (g_DummyWMPCalled)
+				//	{
+				//		g_DummyWMPCalled = false;
+				//		helper_start_wmp();
+				//		DEBUG_PRINT("%s:%d: afl.wmv called\n", __FUNCTION__, __LINE__);
+				//		return;
+				//	}
+				//}
+
+				if (msg->message == options.messageid[i])
+				{
+					if (!options.debug_mode)
+					{
+						char command = 0;
+						DWORD num_read;
+						DEBUG_PRINT("%s:%d: Reading command...\n", __FUNCTION__, __LINE__);
+						ReadFile(pipe, &command, 1, &num_read, NULL);
+						DEBUG_PRINT("%s:%d: Read command: %c\n", __FUNCTION__, __LINE__, command);
+
+						if (command != 'F')
+						{
+							if (command == 'Q')
+							{
+								dr_exit_process(0);
+							}
+							else
+							{
+								DEBUG_PRINT("%s:%d: Command: %c\n", __FUNCTION__, __LINE__, command);
+								DR_ASSERT_MSG(false, "unrecognized command received over pipe");
+							}
+						}
+					}
+					
+					start_instru_ms = get_cur_time();
+					memset(winafl_data.afl_area, 0, MAP_SIZE);
+					winafl_data.previous_offset = 0;
+				}
+			}
+
+			if (start_instru_ms > 0 && get_cur_time() > start_instru_ms + options.timeout)
+			{
+				DEBUG_PRINT("%s:%d: Threshold met\n", __FUNCTION__, __LINE__);
+				if (!options.debug_mode)
+				{
+					//
+					// 1. Before proceed, we need to close the file handle
+					// of the current input test case by starting WMP with
+					// dummy file
+					//
+					/*g_DummyWMPCalled = true;
+					start_dummy_wmp();
+					DEBUG_PRINT("%s:%d: Dummy WMP called\n", __FUNCTION__, __LINE__);*/
+
+					//
+					// 2. Tell afl-fuzz fuzzing is OK
+					//
+					DWORD num_written;
+					WriteFile(pipe, "K", 1, &num_written, NULL);
+					start_instru_ms = 0;
+
+					/*if (getenv("AFL_DRYRUN_COMPLETE") && atoi(getenv("AFL_DRYRUN_COMPLETE")))
+					{
+						helper_start_wmp();
+					}*/
+
+					//
+					// Now we proceed to next input test case
+					//
+					/*char command;
+					ReadFile(pipe, &command, 1, NULL, NULL);
+					if (command == 'S')
+					{
+					helper_start_wmp();
+					}*/
+				}
+				else
+				{
+					DEBUG_BREAK();
+					start_instru_ms = 0;
+					helper_start_wmp();
+				}
+				
+				fuzz_target.iteration++;
+			}
+
+		}
+	}
+}
+#endif // End _WMP
 
 static void
 event_module_unload(void *drcontext, const module_data_t *info)
@@ -465,14 +790,15 @@ event_module_unload(void *drcontext, const module_data_t *info)
     module_table_unload(module_table, info);
 }
 
+int mod_index = 0;
 static void
 event_module_load(void *drcontext, const module_data_t *info, bool loaded)
 {
     const char *module_name = dr_module_preferred_name(info);
     app_pc to_wrap;
 
-    if(options.debug_mode)
-        dr_fprintf(winafl_data.log, "Module loaded, %s\n", module_name);
+	//if (options.debug_mode)
+		dr_fprintf(winafl_data.log, "#%d Module loaded, %s, Loaded address: 0x%x, End address: 0x%x\n", mod_index++, module_name, info->start, info->end);
 
     if(options.fuzz_module[0]) {
 		if (_stricmp(module_name, options.fuzz_module) == 0) {
@@ -491,6 +817,22 @@ event_module_load(void *drcontext, const module_data_t *info, bool loaded)
             to_wrap = (app_pc)dr_get_proc_address(info->handle, "CreateFileA");
             drwrap_wrap(to_wrap, createfilea_interceptor, NULL);
         }
+
+#ifdef _WMP
+		if (_stricmp(module_name, "USER32.dll") == 0) {
+			// TODO: Experimenting if the following are the caused of unknown random WMP crash
+			to_wrap = (app_pc)dr_get_proc_address(info->handle, "MessageBoxExW");
+			drwrap_wrap(to_wrap, messagebox_interceptor, NULL);
+			to_wrap = (app_pc)dr_get_proc_address(info->handle, "MessageBoxExA");
+			drwrap_wrap(to_wrap, messagebox_interceptor, NULL);
+			to_wrap = (app_pc)dr_get_proc_address(info->handle, "DialogBoxIndirectParamAorW");
+			drwrap_wrap(to_wrap, dialogboxidnirectparam_interceptor, NULL);
+			to_wrap = (app_pc)dr_get_proc_address(info->handle, "GetMessageW");
+			drwrap_wrap(to_wrap, getmessage_interceptor_pre, getmessage_interceptor_post);
+			to_wrap = (app_pc)dr_get_proc_address(info->handle, "GetMessageA");
+			drwrap_wrap(to_wrap, getmessage_interceptor_pre, getmessage_interceptor_post);
+		}
+#endif
     }
 
     module_table_load(module_table, info);
@@ -516,6 +858,9 @@ event_exit(void)
     /* destroy module table */
     module_table_destroy(module_table);
 
+//#ifdef _WMP
+//	_putenv_s("AFL_DRYRUN_COMPLETE", "0");
+//#endif
     drx_exit();
     drmgr_exit();
 }
@@ -547,6 +892,20 @@ event_init(void)
         }
     }
 
+#ifdef _WMP
+	else
+	{
+		winafl_data.log =
+			drx_open_unique_appid_file(options.logdir, dr_get_process_id(),
+			"afl", "proc.log",
+			DR_FILE_ALLOW_LARGE,
+			buf, BUFFER_SIZE_ELEMENTS(buf));
+		if (winafl_data.log != INVALID_FILE) {
+			dr_log(NULL, LOG_ALL, 1, "winafl: log file is %s\n", buf);
+			NOTIFY(1, "<created log file %s>\n", buf);
+		}
+	}
+#endif
     fuzz_target.iteration = 0;
 }
 
@@ -603,6 +962,10 @@ options_init(client_id_t id, int argc, const char *argv[])
     options.fuzz_iterations = 1000;
     options.func_args = NULL;
     options.num_fuz_args = 0;
+#ifdef _WMP
+	options.messageid[0] = -1;
+	options.timeout = g_WaitTimeMs; // Default timeout 
+#endif
     dr_snprintf(options.logdir, BUFFER_SIZE_ELEMENTS(options.logdir), ".");
 
     strcpy(options.pipe_name, "\\\\.\\pipe\\afl_pipe_default");
@@ -669,6 +1032,64 @@ options_init(client_id_t id, int argc, const char *argv[])
                 USAGE_CHECK(false, "invalid -verbose number");
             }
         }
+#ifdef _WMP
+		else if (strcmp(token, "-message_id") == 0) {
+			USAGE_CHECK((i + 1) < argc, "missing -message_id");
+			/*
+			*	A message id is typically used by event-based GUI software
+			*	You can select a message id that will trigger the file to be parsed
+			*   You can specify more than one message id using comma (",") as separator
+			*	(For example: On Windows Media Player, WMI_TIMER (0x8000) is triggered
+			*                 continuously)
+			*/
+			int size = strlen(argv[i+1]);
+			char *msg_ids = (char*)dr_global_alloc(size+1);
+			memset(msg_ids, 0, size+1);
+			strncpy(msg_ids, argv[i+1], size);
+			char *p = msg_ids, *start_s = msg_ids;
+			int id = 0;
+
+			if (strrchr(msg_ids, ',') != NULL)
+			{
+				while (1)
+				{
+					if (*p == ',' || *p == '\0')
+					{
+						*p = '\0';
+						options.messageid[id++] = atoi(start_s);
+						// Set the start string to next p
+						start_s = p + 1;
+						//id++;
+					}
+
+					if (p++ >= (msg_ids + size + 1))
+						break;
+				}
+			}
+			else
+			{
+				options.messageid[id] = atoi(start_s);
+			}
+			dr_global_free(msg_ids, size+1);
+			i++;
+		}
+		else if (strcmp(token, "-input_filename") == 0) {
+			USAGE_CHECK((i + 1) < argc, "missing -input_filename file path");
+			/*
+			*  *MUST* be the same as -t option in afl-fuzz
+			*/
+			fuzz_target.cur_input = (char *)dr_global_alloc(MAXIMUM_PATH);
+			memset(fuzz_target.cur_input, 0, MAXIMUM_PATH);
+			strncpy(fuzz_target.cur_input, argv[++i], MAXIMUM_PATH);
+		}
+		else if (strcmp(token, "-timeout") == 0) {
+			/*
+			*	Equivalent to '-t' option under afl-fuzz
+			*/
+			USAGE_CHECK((i + 1) < argc, "missing timetout");
+			options.timeout = strtoul(argv[++i], NULL, 0);
+		}
+#endif
         else {
             NOTIFY(0, "UNRECOGNIZED OPTION: \"%s\"\n", token);
             USAGE_CHECK(false, "invalid option");
@@ -687,14 +1108,12 @@ options_init(client_id_t id, int argc, const char *argv[])
 DR_EXPORT void
 dr_client_main(client_id_t id, int argc, const char *argv[])
 {
-    drreg_options_t ops = {sizeof(ops), 2 /*max slots needed: aflags*/, false};
+    drreg_options_t ops = {sizeof(ops), 3 /*max slots needed: aflags*/, false};
 
     dr_set_client_name("WinAFL", "");
 
-    drmgr_init();
-    drx_init();
-    drreg_init(&ops);
-    drwrap_init();
+	if (!drmgr_init() || !drx_init() || !drwrap_init() || drreg_init(&ops) != DRREG_SUCCESS)
+		DR_ASSERT(false);
 
     options_init(id, argc, argv);
 
@@ -702,15 +1121,16 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
 
     drmgr_register_exception_event(onexception);
 
-    if(options.coverage_kind == COVERAGE_BB) {
-        drmgr_register_bb_instrumentation_event(NULL, instrument_bb_coverage, NULL);
-    } else if(options.coverage_kind == COVERAGE_EDGE) {
-        drmgr_register_bb_instrumentation_event(NULL, instrument_edge_coverage, NULL);
-    }
+	if (options.coverage_kind == COVERAGE_BB) {
+		drmgr_register_bb_instrumentation_event(NULL, instrument_bb_coverage, NULL);
+	}
+	else if (options.coverage_kind == COVERAGE_EDGE) {
+		drmgr_register_bb_instrumentation_event(NULL, instrument_edge_coverage, NULL);
+	}
 
-    drmgr_register_module_load_event(event_module_load);
-    drmgr_register_module_unload_event(event_module_unload);
-    dr_register_nudge_event(event_nudge, id);
+	drmgr_register_module_load_event(event_module_load);
+	drmgr_register_module_unload_event(event_module_unload);
+	dr_register_nudge_event(event_nudge, id);
 
     client_id = id;
 
