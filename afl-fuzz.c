@@ -37,7 +37,7 @@ limitations under the License.
 #include <direct.h>
 
 #define VERSION "1.96b"
-#define WINAFL_VERSION "1.04"
+#define WINAFL_VERSION "1.06"
 
 #include "config.h"
 #include "types.h"
@@ -133,8 +133,8 @@ virgin_crash[MAP_SIZE];    /* Bits we haven't seen in crashes  */
 
 static HANDLE shm_handle;             /* Handle of the SHM region         */
 static HANDLE pipe_handle;            /* Handle of the name pipe          */
-static char   *fuzzer_id = NULL;      /* The fuzzer ID or a randomized
-									  seed allowing multiple instances */
+static char   *fuzzer_id = NULL;      /* The fuzzer ID or a randomized 
+                                         seed allowing multiple instances */
 static HANDLE devnul_handle;          /* Handle of the nul device         */
 static u8     sinkhole_stds = 1;      /* Sink-hole stdout/stderr messages?*/
 
@@ -1237,30 +1237,59 @@ static void setup_shm(void) {
 	unsigned int seeds[2];
 	u64 name_seed;
 	u8 attempts = 0;
+  unsigned int seeds[2];
+  u64 name_seed;
+  u8 attempts = 0;
 
 	if (!in_bitmap) memset(virgin_bits, 255, MAP_SIZE);
 
 	memset(virgin_hang, 255, MAP_SIZE);
 	memset(virgin_crash, 255, MAP_SIZE);
 
-	while (attempts < 5) {
-		if (fuzzer_id == NULL) {
-			// If it is null, it means we have to generate a random seed to name the instance
-			rand_s(&seeds[0]);
-			rand_s(&seeds[1]);
-			name_seed = ((u64)seeds[0] << 32) | seeds[1];
-			fuzzer_id = (char *)alloc_printf("%I64x", name_seed);
-		}
+  while(attempts < 5) {
+    if(fuzzer_id == NULL) {
+      // If it is null, it means we have to generate a random seed to name the instance
+      rand_s(&seeds[0]);
+      rand_s(&seeds[1]);
+      name_seed = ((u64)seeds[0] << 32) | seeds[1];
+      fuzzer_id = (char *)alloc_printf("%I64x", name_seed);
+    }
 
-		shm_str = (char *)alloc_printf("afl_shm_%s", fuzzer_id);
+    shm_str = (char *)alloc_printf("afl_shm_%s", fuzzer_id);
 
-		shm_handle = CreateFileMapping(
-			INVALID_HANDLE_VALUE,    // use paging file
-			NULL,                    // default security
-			PAGE_READWRITE,          // read/write access
-			0,                       // maximum object size (high-order DWORD)
-			MAP_SIZE,                // maximum object size (low-order DWORD)
-			(char *)shm_str);        // name of mapping object
+    shm_handle = CreateFileMapping(
+                   INVALID_HANDLE_VALUE,    // use paging file
+                   NULL,                    // default security
+                   PAGE_READWRITE,          // read/write access
+                   0,                       // maximum object size (high-order DWORD)
+                   MAP_SIZE,                // maximum object size (low-order DWORD)
+                   (char *)shm_str);        // name of mapping object
+
+    if(shm_handle == NULL) {
+      if(sync_id) {
+        PFATAL("CreateFileMapping failed (check slave id)");
+      }
+
+      if(GetLastError() == ERROR_ALREADY_EXISTS) {
+        // We need another attempt to find a unique section name
+        attempts++;
+        ck_free(shm_str);
+        ck_free(fuzzer_id);
+        fuzzer_id = NULL;
+        continue;
+      }
+      else {
+        PFATAL("CreateFileMapping failed");
+      }
+    }
+
+    // We found a section name that works!
+    break;
+  }
+
+  if(attempts == 5) {
+    FATAL("Could not find a section name.\n");
+  }
 
 		if (shm_handle == NULL) {
 			if (sync_id) {
@@ -1280,9 +1309,13 @@ static void setup_shm(void) {
 			}
 		}
 
-		// We found a section name that works!
-		break;
-	}
+  trace_bits = (u8 *)MapViewOfFile(
+    shm_handle,          // handle to map object
+    FILE_MAP_ALL_ACCESS, // read/write permission
+    0,
+    0,
+    MAP_SIZE
+  );
 
 	if (attempts == 5) {
 		FATAL("Could not find a section name.\n");
@@ -2041,27 +2074,27 @@ static void create_target_process(char** argv) {
 	FILE *fp;
 	size_t pidsize;
 	BOOL inherit_handles = TRUE;
+  BOOL inherit_handles = TRUE;
 
 	STARTUPINFO si;
 	PROCESS_INFORMATION pi;
 
-	pipe_name = (char *)alloc_printf("\\\\.\\pipe\\afl_pipe_%s", fuzzer_id);
-	pipe_handle = CreateNamedPipe(
-		pipe_name,                // pipe name
-		PIPE_ACCESS_DUPLEX,       // read/write access
-		0,
-		1,                        // max. instances
-		512,                      // output buffer size
-		512,                      // input buffer size
-		20000,                    // client time-out
-		NULL);                    // default security attribute
+  pipe_name = (char *)alloc_printf("\\\\.\\pipe\\afl_pipe_%s", fuzzer_id);
 
-	if (pipe_handle == INVALID_HANDLE_VALUE)
-	{
-		FATAL("CreateNamedPipe failed, GLE=%d.\n", GetLastError());
-	}
+  pipe_handle = CreateNamedPipe(
+    pipe_name,                // pipe name
+    PIPE_ACCESS_DUPLEX,       // read/write access
+    0,
+    1,                        // max. instances
+    512,                      // output buffer size
+    512,                      // input buffer size
+    20000,                    // client time-out
+    NULL);                    // default security attribute
 
-	target_cmd = argv_to_cmd(argv);
+  if (pipe_handle == INVALID_HANDLE_VALUE)
+  {
+      FATAL("CreateNamedPipe failed, GLE=%d.\n", GetLastError());
+  }
 
 	pidfile = alloc_printf("childpid_%s.txt", fuzzer_id);
 	dr_cmd = alloc_printf(
@@ -2069,24 +2102,26 @@ static void create_target_process(char** argv) {
 		dynamorio_dir, pidfile, client_params, fuzzer_id, target_cmd
 		);
 
-	ZeroMemory(&si, sizeof(si));
-	si.cb = sizeof(si);
-	ZeroMemory(&pi, sizeof(pi));
-
-	if (sinkhole_stds) {
-		si.hStdOutput = si.hStdError = devnul_handle;
-		si.dwFlags |= STARTF_USESTDHANDLES;
-	}
-	else {
-		inherit_handles = FALSE;
-	}
+  pidfile = alloc_printf("childpid_%s.txt", fuzzer_id);
+  dr_cmd = alloc_printf(
+    "%s\\drrun.exe -pidfile %s -no_follow_children -c winafl.dll %s -fuzzer_id %s -- %s",
+    dynamorio_dir, pidfile, client_params, fuzzer_id, target_cmd
+  );
 
 	if (!CreateProcess(NULL, dr_cmd, NULL, NULL, inherit_handles, /*CREATE_NO_WINDOW*//*CREATE_NEW_CONSOLE*/0, NULL, NULL, &si, &pi)) {
 		FATAL("CreateProcess failed, GLE=%d.\n", GetLastError());
 	}
 
-	child_handle = pi.hProcess;
-	child_thread_handle = pi.hThread;
+  if(sinkhole_stds) {
+    si.hStdOutput = si.hStdError = devnul_handle;
+    si.dwFlags |= STARTF_USESTDHANDLES;
+  } else {
+    inherit_handles = FALSE;
+  }
+
+  if(!CreateProcess(NULL, dr_cmd, NULL, NULL, inherit_handles, /*CREATE_NO_WINDOW*/0, NULL, NULL, &si, &pi)) {
+    FATAL("CreateProcess failed, GLE=%d.\n", GetLastError());
+  }
 
 	watchdog_timeout_time = get_cur_time() + exec_tmout;
 	watchdog_enabled = 1;
@@ -2097,7 +2132,11 @@ static void create_target_process(char** argv) {
 		}
 	}
 
-	watchdog_enabled = 0;
+  if(!ConnectNamedPipe(pipe_handle, NULL)) {
+    if(GetLastError() != ERROR_PIPE_CONNECTED) {
+        FATAL("ConnectNamedPipe failed, GLE=%d.\n", GetLastError());
+    }
+  }
 
 	//by the time pipe has connected the pidfile must have been created
 
@@ -2115,6 +2154,7 @@ static void create_target_process(char** argv) {
 	remove(pidfile);
 
 	child_pid = atoi(buf);
+  remove(pidfile);
 
 	free(buf);
 	ck_free(pidfile);
@@ -2233,15 +2273,26 @@ static u8 run_target(char** argv) {
 	DWORD num_read;
 	char result = 0;
 
-	if (sinkhole_stds && devnul_handle == INVALID_HANDLE_VALUE) {
-		devnul_handle = CreateFile(
-			"nul",
-			GENERIC_READ | GENERIC_WRITE,
-			FILE_SHARE_READ | FILE_SHARE_WRITE,
-			NULL,
-			OPEN_EXISTING,
-			0,
-			NULL);
+  if(sinkhole_stds && devnul_handle == INVALID_HANDLE_VALUE) {
+    devnul_handle = CreateFile(
+        "nul",
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL,
+        OPEN_EXISTING,
+        0,
+        NULL);
+
+    if(devnul_handle == INVALID_HANDLE_VALUE) {
+      PFATAL("Unable to open the nul device.");
+    }
+  }
+
+  if(!is_child_running()) {
+    destroy_target_process(0);
+	create_target_process(argv);
+	fuzz_iterations_current = 0;
+  }
 
 		if (devnul_handle == INVALID_HANDLE_VALUE) {
 			PFATAL("Unable to open the nul device.");
@@ -7140,16 +7191,14 @@ static void extract_client_params(u32 argc, char** argv) {
 	optind++;
 	opt_start = optind;
 
-	for (i = optind; i < argc; i++) {
-		if (strcmp(argv[i], "--") == 0) break;
-		nclientargs++;
-		len += strlen(argv[i]) + 1;
-	}
+  for (i = optind; i < argc; i++) {
+    if(strcmp(argv[i],"--") == 0) break;
+    nclientargs++;
+    len += strlen(argv[i]) + 1;
+  }
 
 	if (i == argc) usage(argv[0]);
 	opt_end = i;
-
-	buf = client_params = ck_alloc(len);
 
 	for (i = opt_start; i < opt_end; i++) {
 
@@ -7165,7 +7214,9 @@ static void extract_client_params(u32 argc, char** argv) {
 		buf--;
 	}
 
-	*buf = 0;
+  if(buf != client_params) {
+    buf--;
+  }
 
 	optind = opt_end;
 
@@ -7176,6 +7227,14 @@ static void extract_client_params(u32 argc, char** argv) {
 			fuzz_iterations_max = atoi(argv[i + 1]);
 		}
 	}
+
+  //extract the number of fuzz iterations from client params
+  fuzz_iterations_max = 1000;
+  for (i = opt_start; i < opt_end; i++) {
+    if((strcmp(argv[i], "-fuzz_iterations") == 0) && ((i + 1) < opt_end)) {
+      fuzz_iterations_max = atoi(argv[i+1]);
+    }
+  }
 
 }
 
@@ -7204,33 +7263,33 @@ client_params[client_params_sz] = 0;
 
 
 int getopt(int argc, char **argv, char *optstring) {
-	char *c;
+  char *c;
 
-	optarg = NULL;
+  optarg = NULL;
 
-	while (1) {
-		if (optind == argc) return -1;
-		if (strcmp(argv[optind], "--") == 0) return -1;
-		if (argv[optind][0] != '-') {
-			optind++;
-			continue;
-		}
-		if (!argv[optind][1]) {
-			optind++;
-			continue;
-		}
+  while(1) {
+    if(optind == argc) return -1;
+    if(strcmp(argv[optind], "--") == 0) return -1;
+    if(argv[optind][0] != '-') {
+      optind++;
+      continue;
+    }
+    if(!argv[optind][1]) {
+      optind++;
+      continue;
+    }
 
-		c = strchr(optstring, argv[optind][1]);
-		if (!c) return -1;
-		optind++;
-		if (c[1] == ':') {
-			if (optind == argc) return -1;
-			optarg = argv[optind];
-			optind++;
-		}
+    c = strchr(optstring, argv[optind][1]);
+    if(!c) return -1;
+    optind++;
+    if(c[1] == ':') {
+      if(optind == argc) return -1;
+      optarg = argv[optind];
+      optind++;
+    }
 
-		return (int)(c[0]);
-	}
+    return (int)(c[0]);
+  }
 }
 
 /* Main entry point */
@@ -7290,10 +7349,10 @@ int main(int argc, char** argv) {
 
 		case 'S': /* sync ID */
 
-			if (sync_id) FATAL("Multiple -S or -M options not supported");
-			sync_id = optarg;
-			fuzzer_id = sync_id;
-			break;
+        if (sync_id) FATAL("Multiple -S or -M options not supported");
+        sync_id = optarg;
+        fuzzer_id = sync_id;
+        break;
 
 		case 'f': /* target file */
 
@@ -7443,6 +7502,7 @@ int main(int argc, char** argv) {
 	if (getenv("AFL_NO_VAR_CHECK"))  no_var_check = 1;
 	if (getenv("AFL_SHUFFLE_QUEUE")) shuffle_queue = 1;
 	if (getenv("AFL_NO_SINKHOLE"))   sinkhole_stds = 0;
+  if (getenv("AFL_NO_SINKHOLE"))   sinkhole_stds    = 0;
 
 	if (dumb_mode == 2 && no_forkserver)
 		FATAL("AFL_DUMB_FORKSRV and AFL_NO_FORKSRV are mutually exclusive");
@@ -7462,7 +7522,11 @@ int main(int argc, char** argv) {
 	child_handle = NULL;
 	pipe_handle = NULL;
 
-	devnul_handle = INVALID_HANDLE_VALUE;
+  devnul_handle = INVALID_HANDLE_VALUE;
+
+  setup_dirs_fds();
+  read_testcases();
+  load_auto();
 
 	setup_dirs_fds();
 	read_testcases();
@@ -7584,22 +7648,23 @@ stop_fuzzing:
 
 	}
 
-	if (devnul_handle != INVALID_HANDLE_VALUE) {
-		CloseHandle(devnul_handle);
-	}
+  if(devnul_handle != INVALID_HANDLE_VALUE) {
+    CloseHandle(devnul_handle);
+  }
 
-	fclose(plot_file);
-	destroy_queue();
-	destroy_extras();
-	ck_free(target_path);
+  fclose(plot_file);
+  destroy_queue();
+  destroy_extras();
+  ck_free(target_path);
+
+  if(fuzzer_id != NULL && fuzzer_id != sync_id)
+    ck_free(fuzzer_id);
+
+  alloc_report();
 
 	if (fuzzer_id != NULL && fuzzer_id != sync_id)
 		ck_free(fuzzer_id);
 
 	alloc_report();
-
-	OKF("We're done here. Have a nice day!\n");
-
-	exit(0);
 
 }

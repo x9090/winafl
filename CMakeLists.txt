@@ -16,6 +16,12 @@ add_executable(test_gdiplus
 
 target_link_libraries(test_gdiplus gdiplus)
 
+project(afl-showmap)
+
+add_executable(afl-showmap
+  afl-showmap.c
+  )
+
 
 project(afl-fuzz)
 
@@ -48,4 +54,10 @@ use_DynamoRIO_extension(winafl drx)
 use_DynamoRIO_extension(winafl drcontainers)
 use_DynamoRIO_extension(winafl drreg)
 use_DynamoRIO_extension(winafl drwrap)
+
+# VS2015 Fix
+if (NOT (MSVC_VERSION LESS 1900))
+  target_link_libraries(winafl "libucrt.lib")
+  target_link_libraries(winafl "libvcruntime.lib")
+endif()
 

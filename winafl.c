@@ -115,6 +115,7 @@ typedef struct _winafl_option_t {
     int fuzz_iterations;
     void **func_args;
     int num_fuz_args;
+    drwrap_callconv_t callconv;
 #ifdef _WMP
 	unsigned long timeout;
 	int messageid[MAXIMUM_MESSAGE_IDS];
@@ -242,7 +243,7 @@ onexception(void *drcontext, dr_exception_t *excpt) {
     if(options.debug_mode)
         dr_fprintf(winafl_data.log, "Exception caught: %x\n", exception_code);
 
-    if((exception_code == EXCEPTION_ACCESS_VIOLATION) || 
+    if((exception_code == EXCEPTION_ACCESS_VIOLATION) ||
        (exception_code == EXCEPTION_ILLEGAL_INSTRUCTION) ||
        (exception_code == EXCEPTION_PRIV_INSTRUCTION) ||
        (exception_code == EXCEPTION_STACK_OVERFLOW)) {
@@ -286,7 +287,7 @@ static dr_emit_flags_t
 instrument_bb_coverage(void *drcontext, void *tag, instrlist_t *bb, instr_t *inst,
                       bool for_trace, bool translating, void *user_data)
 {
-	static bool debug_information_output = false;
+    static bool debug_information_output = false;
     app_pc start_pc;
     module_entry_t **mod_entry_cache;
     module_entry_t *mod_entry;
@@ -303,7 +304,7 @@ instrument_bb_coverage(void *drcontext, void *tag, instrlist_t *bb, instr_t *ins
     mod_entry_cache = winafl_data.cache;
     mod_entry = module_table_lookup(mod_entry_cache,
                                                 NUM_THREAD_MODULE_CACHE,
-                                                module_table, start_pc);    
+                                                module_table, start_pc);
 
     if (mod_entry == NULL || mod_entry->data == NULL) return DR_EMIT_DEFAULT;
 
@@ -312,8 +313,12 @@ instrument_bb_coverage(void *drcontext, void *tag, instrlist_t *bb, instr_t *ins
     should_instrument = false;
     target_modules = options.target_modules;
     while(target_modules) {
-		if (_stricmp(module_name, target_modules->module_name) == 0) {
+        if(_stricmp(module_name, target_modules->module_name) == 0) {
             should_instrument = true;
+            if(options.debug_mode && debug_information_output == false) {
+                dr_fprintf(winafl_data.log, "Instrumenting %s with the 'bb' mode\n", module_name);
+                debug_information_output = true;
+            }
             break;
         }
         target_modules = target_modules->next;
@@ -331,7 +336,7 @@ instrument_bb_coverage(void *drcontext, void *tag, instrlist_t *bb, instr_t *ins
 
     offset = (uint)(start_pc - mod_entry->data->start);
     offset &= MAP_SIZE - 1;
-    
+
     drreg_reserve_aflags(drcontext, bb, inst);
 
     instrlist_meta_preinsert(bb, inst,
@@ -348,7 +353,7 @@ static dr_emit_flags_t
 instrument_edge_coverage(void *drcontext, void *tag, instrlist_t *bb, instr_t *inst,
                       bool for_trace, bool translating, void *user_data)
 {
-	static bool debug_information_output = false;
+    static bool debug_information_output = false;
     app_pc start_pc;
     module_entry_t **mod_entry_cache;
     module_entry_t *mod_entry;
@@ -382,6 +387,10 @@ instrument_edge_coverage(void *drcontext, void *tag, instrlist_t *bb, instr_t *i
     while(target_modules) {
         if(_stricmp(module_name, target_modules->module_name) == 0) {
             should_instrument = true;
+            if(options.debug_mode && debug_information_output == false) {
+                dr_fprintf(winafl_data.log, "Instrumenting %s with the 'edge' mode\n", module_name);
+                debug_information_output = true;
+            }
             break;
         }
         target_modules = target_modules->next;
@@ -406,7 +415,7 @@ instrument_edge_coverage(void *drcontext, void *tag, instrlist_t *bb, instr_t *i
 #ifdef _WIN64
 
     drreg_reserve_register(drcontext, bb, inst, NULL, &reg2);
-    
+
     //load previous offset into register
     opnd1 = opnd_create_reg(reg);
     opnd2 = OPND_CREATE_ABSMEM(&(winafl_data.previous_offset), OPSZ_8);
@@ -796,11 +805,16 @@ int mod_index = 0;
 static void
 event_module_load(void *drcontext, const module_data_t *info, bool loaded)
 {
-    const char *module_name = dr_module_preferred_name(info);
+    const char *module_name = info->names.exe_name;
     app_pc to_wrap;
 
+    if (module_name == NULL) {
+        // In case exe_name is not defined, we will fall back on the preferred name.
+        module_name = dr_module_preferred_name(info);
+    }
+
 	//if (options.debug_mode)
-		dr_fprintf(winafl_data.log, "#%d Module loaded, %s, Loaded address: 0x%x, End address: 0x%x\n", mod_index++, module_name, info->start, info->end);
+	dr_fprintf(winafl_data.log, "#%d Module loaded, %s, Loaded address: 0x%x, End address: 0x%x\n", mod_index++, module_name, info->start, info->end);
 
     if(options.fuzz_module[0]) {
 		if (_stricmp(module_name, options.fuzz_module) == 0) {
@@ -810,9 +824,9 @@ event_module_load(void *drcontext, const module_data_t *info, bool loaded)
                 to_wrap = (app_pc)dr_get_proc_address(info->handle, options.fuzz_method);
                 DR_ASSERT_MSG(to_wrap, "Can't find specified method in fuzz_module");
             }
-            drwrap_wrap(to_wrap, pre_fuzz_handler, post_fuzz_handler);
+            drwrap_wrap_ex(to_wrap, pre_fuzz_handler, post_fuzz_handler, NULL, options.callconv);
         }
-    
+
 		if (options.debug_mode && (_stricmp(module_name, "KERNEL32.dll") == 0)) {
             to_wrap = (app_pc)dr_get_proc_address(info->handle, "CreateFileW");
             drwrap_wrap(to_wrap, createfilew_interceptor, NULL);
@@ -849,7 +863,7 @@ event_exit(void)
         } else if(debug_data.post_handler_called == 0) {
             dr_fprintf(winafl_data.log, "WARNING: Post-fuzz handler was never reached. Did the target function return normally?\n");
         } else {
-            dr_fprintf(winafl_data.log, "Everything appears to be running normally.\n");            
+            dr_fprintf(winafl_data.log, "Everything appears to be running normally.\n");
         }
 
         dr_fprintf(winafl_data.log, "Coverage map follows:\n");
@@ -914,16 +928,16 @@ event_init(void)
 
 static void
 setup_pipe() {
-    pipe = CreateFile( 
-         options.pipe_name,   // pipe name 
-         GENERIC_READ |  // read and write access 
-         GENERIC_WRITE, 
-         0,              // no sharing 
+    pipe = CreateFile(
+         options.pipe_name,   // pipe name
+         GENERIC_READ |  // read and write access
+         GENERIC_WRITE,
+         0,              // no sharing
          NULL,           // default security attributes
-         OPEN_EXISTING,  // opens existing pipe 
-         0,              // default attributes 
-         NULL);          // no template file 
- 
+         OPEN_EXISTING,  // opens existing pipe
+         0,              // default attributes
+         NULL);          // no template file
+
     if (pipe == INVALID_HANDLE_VALUE) DR_ASSERT_MSG(false, "error connecting to pipe");
 }
 
@@ -964,6 +978,7 @@ options_init(client_id_t id, int argc, const char *argv[])
     options.fuzz_iterations = 1000;
     options.func_args = NULL;
     options.num_fuz_args = 0;
+    options.callconv = DRWRAP_CALLCONV_DEFAULT;
 #ifdef _WMP
 	options.messageid[0] = -1;
 	options.timeout = g_WaitTimeMs; // Default timeout 
@@ -1033,6 +1048,20 @@ options_init(client_id_t id, int argc, const char *argv[])
             if (dr_sscanf(token, "%u", &verbose) != 1) {
                 USAGE_CHECK(false, "invalid -verbose number");
             }
+        }
+        else if (strcmp(token, "-call_convention") == 0) {
+            USAGE_CHECK((i + 1) < argc, "missing calling convention");
+            ++i;
+            if (strcmp(argv[i], "stdcall") == 0)
+                options.callconv = DRWRAP_CALLCONV_CDECL;
+            else if (strcmp(argv[i], "fastcall") == 0)
+                options.callconv = DRWRAP_CALLCONV_FASTCALL;
+            else if (strcmp(argv[i], "thiscall") == 0)
+                options.callconv = DRWRAP_CALLCONV_THISCALL;
+            else if (strcmp(argv[i], "ms64") == 0)
+                options.callconv = DRWRAP_CALLCONV_MICROSOFT_X64;
+            else
+                NOTIFY(0, "Unknown calling convention, using default value instead.\n");
         }
 #ifdef _WMP
 		else if (strcmp(token, "-message_id") == 0) {

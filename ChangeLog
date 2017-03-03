@@ -3,6 +3,37 @@ ChangeLog
 =========
 
 ----------------------------------
+Version 1.06 (based on afl 1.96b):
+----------------------------------
+  - Windows port of afl-cmin
+    Contributed by Axel "0vercl0k" Souchet of MSRC Vulnerabilities and Mitigations Team
+  - Use exe_name instead of the preferred name
+    Contributed by Axel "0vercl0k" Souchet of MSRC Vulnerabilities and Mitigations Team
+  - Add option to choose the calling convention
+    Contributed by shawndenbow
+  - Fix for building on VS2015
+    Contributed by b1ack0wl
+
+----------------------------------
+Version 1.05 (based on afl 1.96b):
+----------------------------------
+  - Windows port of afl-showmap
+    Contributed by Axel "0vercl0k" Souchet of MSRC Vulnerabilities and Mitigations Team
+  - Expaded README a bit.
+
+----------------------------------
+Version 1.04 (based on afl 1.96b):
+----------------------------------
+
+  Various fixes / improvements contributed by Axel "0vercl0k" Souchet:
+  - Mute stdout/stderr unless AFL_NO_SINKHOLE env variable is set.
+  - Allow several slaveless instances to be run on the same machine.
+  - Fix getopt to properly handle options without parameters.
+  - Automatically remove the child pid file.
+  - Case insensitive module name comparison.
+  - More debugging messages.
+
+----------------------------------
 Version 1.03 (based on afl 1.96b):
 ----------------------------------
 
