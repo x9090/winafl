@@ -525,8 +525,9 @@ post_fuzz_handler(void *wrapcxt, void *user_data)
     DWORD num_written;
     dr_mcontext_t *mc = drwrap_get_mcontext(wrapcxt);
 	app_pc addr = drwrap_get_func(wrapcxt);
-
+	
     if(!options.debug_mode) {
+		DEBUG_PRINT("%s:%d: Sending OK command to afl-fuzz\n", __FUNCTION__, __LINE__);
         WriteFile(pipe, "K", 1, &num_written, NULL);
     } else {
         debug_data.post_handler_called++;
@@ -562,7 +563,6 @@ createfilea_interceptor(void *wrapcxt, INOUT void **user_data)
         dr_fprintf(winafl_data.log, "In OpenFileA, reading %s\n", filename);
 }
 
-#ifdef _WMP
 static void
 messagebox_interceptor(void *wrapcxt, INOUT void **user_data)
 {
@@ -583,6 +583,8 @@ dialogboxidnirectparam_interceptor(void *wrapcxt, INOUT void **user_data)
 	DEBUG_PRINT("%s:%d: drwrap_skip_call: %d\n", __FUNCTION__, __LINE__, res);
 
 }
+
+#ifdef _WMP
 
 static void
 helper_start_wmp()
@@ -818,7 +820,6 @@ event_module_load(void *drcontext, const module_data_t *info, bool loaded)
             drwrap_wrap(to_wrap, createfilea_interceptor, NULL);
         }
 
-#ifdef _WMP
 		if (_stricmp(module_name, "USER32.dll") == 0) {
 			// TODO: Experimenting if the following are the caused of unknown random WMP crash
 			to_wrap = (app_pc)dr_get_proc_address(info->handle, "MessageBoxExW");
@@ -827,12 +828,13 @@ event_module_load(void *drcontext, const module_data_t *info, bool loaded)
 			drwrap_wrap(to_wrap, messagebox_interceptor, NULL);
 			to_wrap = (app_pc)dr_get_proc_address(info->handle, "DialogBoxIndirectParamAorW");
 			drwrap_wrap(to_wrap, dialogboxidnirectparam_interceptor, NULL);
+#ifdef _WMP
 			to_wrap = (app_pc)dr_get_proc_address(info->handle, "GetMessageW");
 			drwrap_wrap(to_wrap, getmessage_interceptor_pre, getmessage_interceptor_post);
 			to_wrap = (app_pc)dr_get_proc_address(info->handle, "GetMessageA");
 			drwrap_wrap(to_wrap, getmessage_interceptor_pre, getmessage_interceptor_post);
-		}
 #endif
+		}
     }
 
     module_table_load(module_table, info);
@@ -883,7 +885,7 @@ event_init(void)
 
         winafl_data.log =
             drx_open_unique_appid_file(options.logdir, dr_get_process_id(),
-                                   "afl", "proc.log",
+                                   "afl_debug", "proc.log",
                                    DR_FILE_ALLOW_LARGE,
                                    buf, BUFFER_SIZE_ELEMENTS(buf));
         if (winafl_data.log != INVALID_FILE) {
@@ -892,12 +894,12 @@ event_init(void)
         }
     }
 
-#ifdef _WMP
+
 	else
 	{
 		winafl_data.log =
 			drx_open_unique_appid_file(options.logdir, dr_get_process_id(),
-			"afl", "proc.log",
+			"afl_release", "proc.log",
 			DR_FILE_ALLOW_LARGE,
 			buf, BUFFER_SIZE_ELEMENTS(buf));
 		if (winafl_data.log != INVALID_FILE) {
@@ -905,7 +907,7 @@ event_init(void)
 			NOTIFY(1, "<created log file %s>\n", buf);
 		}
 	}
-#endif
+
     fuzz_target.iteration = 0;
 }
 

@@ -332,27 +332,21 @@ event_soft_kill(process_id_t pid, int exit_code)
 /****************************************************************************
  * Event Callbacks
  */
-
-static void
-dump_winafl_data()
-{
-    dr_write_file(winafl_data.log, winafl_data.afl_area, MAP_SIZE);
-}
-
 static bool
 onexception(void *drcontext, dr_exception_t *excpt) {
     DWORD num_written;
     DWORD exception_code = excpt->record->ExceptionCode;
 
-    
-    dr_fprintf(winafl_data.log, "Exception caught: %x\n", exception_code);
+	if (options.debug_mode)
+		dr_fprintf(winafl_data.log, "Exception caught: %x\n", exception_code);
 
     if((exception_code == EXCEPTION_ACCESS_VIOLATION) || (exception_code == EXCEPTION_ILLEGAL_INSTRUCTION) ||
        (exception_code == EXCEPTION_PRIV_INSTRUCTION) || (exception_code == EXCEPTION_STACK_OVERFLOW)) 
     {
         //__debugbreak();
         // Redirect execution to our specified start function
-        dr_fprintf(winafl_data.log, "crashed at %08x\n", excpt->mcontext->pc);
+		if (options.debug_mode)
+			dr_fprintf(winafl_data.log, "crashed at %08x\n", excpt->mcontext->pc);
         dr_fprintf(cov_target.log, "crashed at %08x\n", excpt->mcontext->pc);
         if (options.corpus_list)
         {
@@ -461,176 +455,10 @@ bool for_trace, bool translating, OUT void **user_data)
 #else
     dr_snprintf(bb_entry, BUFFER_SIZE_ELEMENTS(bb_entry), "%d|%08x\n", mod_entry->id, offset);
 #endif
-    DEBUG_PRINT("%s:%d:%s: Post BB hit at block %08x\n", __FUNCTION__, __LINE__, cov_target.cur_covlog, offset);
+    //DEBUG_PRINT("%s:%d:%s: Post BB hit at block %08x\n", __FUNCTION__, __LINE__, cov_target.cur_covlog, offset);
     dr_write_file(cov_target.log, bb_entry, strlen(bb_entry));
 
 
-
-    return DR_EMIT_DEFAULT;
-}
-
-static dr_emit_flags_t
-instrument_bb_coverage(void *drcontext, void *tag, instrlist_t *bb, instr_t *inst,
-                      bool for_trace, bool translating, void *user_data)
-{
-    app_pc start_pc;
-    module_entry_t **mod_entry_cache;
-    module_entry_t *mod_entry;
-    const char *module_name;
-    uint offset;
-    target_module_t *target_modules;
-    bool should_instrument;
-
-    if (!drmgr_is_first_instr(drcontext, inst))
-        return DR_EMIT_DEFAULT;
-
-    start_pc = dr_fragment_app_pc(tag);
-
-    mod_entry_cache = winafl_data.cache;
-    mod_entry = module_table_lookup(mod_entry_cache, NUM_THREAD_MODULE_CACHE, module_table, start_pc);    
-
-    if (mod_entry == NULL || mod_entry->data == NULL) return DR_EMIT_DEFAULT;
-
-    module_name = dr_module_preferred_name(mod_entry->data);
-
-    should_instrument = false;
-    target_modules = options.target_modules;
-    while(target_modules) {
-        if(stricmp(module_name, target_modules->module_name) == 0) {
-            should_instrument = true;
-            break;
-        }
-        target_modules = target_modules->next;
-    }
-    if(!should_instrument) return DR_EMIT_DEFAULT;
-
-    offset = (uint)(start_pc - mod_entry->data->start);
-    offset &= MAP_SIZE - 1;
-    
-    drreg_reserve_aflags(drcontext, bb, inst);
-
-    instrlist_meta_preinsert(bb, inst,
-        INSTR_CREATE_inc(drcontext, OPND_CREATE_ABSMEM
-        (&(winafl_data.afl_area[offset]), OPSZ_1)));
-
-    drreg_unreserve_aflags(drcontext, bb, inst);
-
-    return DR_EMIT_DEFAULT;
-}
-
-static dr_emit_flags_t
-instrument_edge_coverage(void *drcontext, void *tag, instrlist_t *bb, instr_t *inst,
-                      bool for_trace, bool translating, void *user_data)
-{
-    app_pc start_pc;
-    module_entry_t **mod_entry_cache;
-    module_entry_t *mod_entry;
-    reg_id_t reg;
-#ifdef _WIN64
-    reg_id_t reg2;
-#endif
-    opnd_t opnd1, opnd2;
-    instr_t *new_instr;
-    const char *module_name;
-    uint offset;
-    target_module_t *target_modules;
-    bool should_instrument;
-
-    if (!drmgr_is_first_instr(drcontext, inst))
-        return DR_EMIT_DEFAULT;
-
-    start_pc = dr_fragment_app_pc(tag);
-
-    mod_entry_cache = winafl_data.cache;
-    mod_entry = module_table_lookup(mod_entry_cache, NUM_THREAD_MODULE_CACHE, module_table, start_pc);
-
-    if (mod_entry == NULL || mod_entry->data == NULL) return DR_EMIT_DEFAULT;
-
-    module_name = dr_module_preferred_name(mod_entry->data);
-
-    should_instrument = false;
-    target_modules = options.target_modules;
-    while(target_modules) {
-        if(_stricmp(module_name, target_modules->module_name) == 0) {
-            should_instrument = true;
-            break;
-        }
-        target_modules = target_modules->next;
-    }
-    if(!should_instrument) return DR_EMIT_DEFAULT;
-
-    offset = (uint)(start_pc - mod_entry->data->start);
-    offset &= MAP_SIZE - 1;
-
-    drreg_reserve_aflags(drcontext, bb, inst);
-    drreg_reserve_register(drcontext, bb, inst, NULL, &reg);
-
-#ifdef _WIN64
-
-    drreg_reserve_register(drcontext, bb, inst, NULL, &reg2);
-    
-    //load previous offset into register
-    opnd1 = opnd_create_reg(reg);
-    opnd2 = OPND_CREATE_ABSMEM(&(winafl_data.previous_offset), OPSZ_8);
-    new_instr = INSTR_CREATE_mov_ld(drcontext, opnd1, opnd2);
-    instrlist_meta_preinsert(bb, inst, new_instr);
-
-    //xor register with the new offset
-    opnd1 = opnd_create_reg(reg);
-    opnd2 = OPND_CREATE_INT32(offset);
-    new_instr = INSTR_CREATE_xor(drcontext, opnd1, opnd2);
-    instrlist_meta_preinsert(bb, inst, new_instr);
-
-    //load address of shm into the second register
-    opnd1 = opnd_create_reg(reg2);
-    opnd2 = OPND_CREATE_INT64((uint64)winafl_data.afl_area);
-    new_instr = INSTR_CREATE_mov_imm(drcontext, opnd1, opnd2);
-    instrlist_meta_preinsert(bb, inst, new_instr);
-
-    //increase the counter at reg + reg2
-    opnd1 = opnd_create_base_disp(reg2, reg, 1, 0, OPSZ_1);
-    new_instr = INSTR_CREATE_inc(drcontext, opnd1);
-    instrlist_meta_preinsert(bb, inst, new_instr);
-
-    //store the new value
-    offset = (offset >> 1)&(MAP_SIZE - 1);
-    opnd1 = OPND_CREATE_ABSMEM(&(winafl_data.previous_offset), OPSZ_8);
-    opnd2 = OPND_CREATE_INT32(offset);
-    new_instr = INSTR_CREATE_mov_st(drcontext, opnd1, opnd2);
-    instrlist_meta_preinsert(bb, inst, new_instr);
-
-    drreg_unreserve_register(drcontext, bb, inst, reg2);
-
-#else
-
-    //load previous offset into register
-    opnd1 = opnd_create_reg(reg);
-    opnd2 = OPND_CREATE_ABSMEM(&(winafl_data.previous_offset), OPSZ_4);
-    new_instr = INSTR_CREATE_mov_ld(drcontext, opnd1, opnd2);
-    instrlist_meta_preinsert(bb, inst, new_instr);
-
-    //xor register with the new offset
-    opnd1 = opnd_create_reg(reg);
-    opnd2 = OPND_CREATE_INT32(offset);
-    new_instr = INSTR_CREATE_xor(drcontext, opnd1, opnd2);
-    instrlist_meta_preinsert(bb, inst, new_instr);
-
-    //increase the counter at afl_area+reg
-    opnd1 = OPND_CREATE_MEM8(reg, (int)winafl_data.afl_area);
-    new_instr = INSTR_CREATE_inc(drcontext, opnd1);
-    instrlist_meta_preinsert(bb, inst, new_instr);
-
-    //store the new value
-    offset = (offset >> 1)&(MAP_SIZE - 1);
-    opnd1 = OPND_CREATE_ABSMEM(&(winafl_data.previous_offset), OPSZ_4);
-    opnd2 = OPND_CREATE_INT32(offset);
-    new_instr = INSTR_CREATE_mov_st(drcontext, opnd1, opnd2);
-    instrlist_meta_preinsert(bb, inst, new_instr);
-
-#endif
-
-    drreg_unreserve_register(drcontext, bb, inst, reg);
-    drreg_unreserve_aflags(drcontext, bb, inst);
 
     return DR_EMIT_DEFAULT;
 }
@@ -729,7 +557,6 @@ pre_fuzz_handler(void *wrapcxt, INOUT void **user_data)
 	* g_filelist pointer will be adjusted in post-callback function
 	*/
 	helper_prepare_cov_log();
-    memset(winafl_data.afl_area, 0, MAP_SIZE);
     winafl_data.previous_offset = 0;
 }
 
@@ -752,22 +579,6 @@ post_fuzz_handler(void *wrapcxt, void *user_data)
 
 	helper_next_cov_log();
 
-//#ifdef _WMP
-//	// Redirect execution only when we reach a threshold of same message event obtained from GetMessage
-//	if (g_BoolShouldProceed)
-//	{
-//		// Reset other variables
-//		prev_messageid = 0;
-//		g_BoolShouldProceed = false;
-//
-//		// Perform loop
-//		mc->xsp = cov_target.xsp;
-//		mc->xcx = cov_target.xcx;
-//		mc->pc = cov_target.func_pc;
-//		drwrap_redirect_execution(wrapcxt);
-//	}
-//
-//#else
 	mc->xsp = cov_target.xsp;
 	mc->xcx = cov_target.xcx;
 	mc->pc = cov_target.func_pc;
@@ -852,6 +663,8 @@ getmessage_interceptor_pre(void *wrapcxt, INOUT void **user_data)
 	*user_data = (MSG*)msg;
 }
 
+
+#ifdef _WMP
 #define MAX_PARAMETER 32768
 static void
 helper_start_wmp()
@@ -909,7 +722,7 @@ getmessage_interceptor_post(void *wrapcxt, void *user_data)
 		}
 	}
 }
-
+#endif // End _WMP
 static void
 event_module_unload(void *drcontext, const module_data_t *info)
 {
@@ -923,15 +736,15 @@ event_module_load(void *drcontext, const module_data_t *info, bool loaded)
     const char *module_name = dr_module_preferred_name(info);
     app_pc to_wrap;
 
-    
-    dr_fprintf(winafl_data.log, "#%d Module loaded, %s, Loaded address: 0x%x\n", mod_index, module_name, info->start);
+	if (options.debug_mode)
+		dr_fprintf(winafl_data.log, "#%d Module loaded, %s, Loaded address: 0x%x\n", mod_index, module_name, info->start);
 
     if(options.fuzz_module[0]) {
         if(_stricmp(module_name, options.fuzz_module) == 0) {
             if(options.fuzz_offset) {
                 to_wrap = info->start + options.fuzz_offset;
             } else {
-                to_wrap = (app_pc)dr_get_proc_address(info->handle, options.fuzz_method);
+				to_wrap = (app_pc)dr_get_proc_address(info->handle, options.fuzz_method);
                 DR_ASSERT_MSG(to_wrap, "Can't find specified method in fuzz_module");
             }
             drwrap_wrap(to_wrap, pre_fuzz_handler, post_fuzz_handler);
@@ -951,11 +764,8 @@ event_module_load(void *drcontext, const module_data_t *info, bool loaded)
             drwrap_wrap(to_wrap, messagebox_interceptor, NULL);
             to_wrap = (app_pc)dr_get_proc_address(info->handle, "DialogBoxIndirectParamAorW");
             drwrap_wrap(to_wrap, dialogboxidnirectparam_interceptor, NULL);
-#ifdef _WMP
-			to_wrap = (app_pc)dr_get_proc_address(info->handle, "GetMessageW");
-			drwrap_wrap(to_wrap, getmessage_interceptor_pre, getmessage_interceptor_post);
-#endif
         }
+
     }
 
     if (options.target_modules)
@@ -986,18 +796,15 @@ event_module_load(void *drcontext, const module_data_t *info, bool loaded)
 static void
 event_exit(void)
 {
-    if (debug_data.pre_handler_called == 0) {
+    if (options.debug_mode && debug_data.pre_handler_called == 0) {
         dr_fprintf(winafl_data.log, "WARNING: Target function was never called. Incorrect target_offset?\n");
     }
-    else if (debug_data.post_handler_called == 0) {
+	else if (options.debug_mode && debug_data.post_handler_called == 0) {
         dr_fprintf(winafl_data.log, "WARNING: Post-fuzz handler was never reached. Did the target function return normally?\n");
     }
-    else {
+	else if (options.debug_mode){
         dr_fprintf(winafl_data.log, "Everything appears to be running normally.\n");
     }
-
-    // dr_fprintf(winafl_data.log, "Coverage map follows:\n");
-    //dump_winafl_data();
 
     /* destroy module table */
     module_table_destroy(module_table);
@@ -1006,15 +813,18 @@ event_exit(void)
     double elapsed;
     end_time = time(NULL);
     elapsed = difftime(end_time, start_time);
-    if (elapsed < 60)
-        dr_fprintf(winafl_data.log, "Elapsed time: %.2f seconds\n", elapsed);
-    else if (elapsed > 60 && elapsed < 60 * 60)
-        dr_fprintf(winafl_data.log, "Elapsed time: %.2f minutes\n", (elapsed/60));
-    else if (elapsed > 60 *60 && elapsed < 60 * 60 * 24)
-        dr_fprintf(winafl_data.log, "Elapsed time: %.2f hours\n", (elapsed/60/60));
-    else
-        dr_fprintf(winafl_data.log, "Elapsed time: ~%d days\n", ceil(elapsed/60/60/24));
-    dr_close_file(winafl_data.log);
+	if (options.debug_mode)
+	{
+		if (elapsed < 60)
+			dr_fprintf(winafl_data.log, "Elapsed time: %.2f seconds\n", elapsed);
+		else if (elapsed > 60 && elapsed < 60 * 60)
+			dr_fprintf(winafl_data.log, "Elapsed time: %.2f minutes\n", (elapsed / 60));
+		else if (elapsed > 60 * 60 && elapsed < 60 * 60 * 24)
+			dr_fprintf(winafl_data.log, "Elapsed time: %.2f hours\n", (elapsed / 60 / 60));
+		else
+			dr_fprintf(winafl_data.log, "Elapsed time: ~%d days\n", ceil(elapsed / 60 / 60 / 24));
+		dr_close_file(winafl_data.log);
+	}
     drx_exit();
     drmgr_exit();
 }
@@ -1026,8 +836,7 @@ event_init(void)
 
     module_table = module_table_create();
 
-    memset(winafl_data.cache, 0, sizeof(winafl_data.cache));
-    memset(winafl_data.afl_area, 0, MAP_SIZE);
+	memset(winafl_data.cache, 0, sizeof(winafl_data.cache));
 
     winafl_data.previous_offset = 0;
 
@@ -1052,40 +861,55 @@ event_init(void)
     cov_target.log = NULL;
 }
 
+// -----------------------------------------------------------------------
+/*
+	thread_close_nuidialog
+	Watchdog thread to monitor and close NUIDialog
+	Refer Cuckoo's auxiliary human.py
+*/
+// -----------------------------------------------------------------------
+static void WINAPIV
+thread_close_nuidialog(void *context)
+{
+	HWND hWnd = NULL;
+	char *lpszClassName = "NUIDialog";
+	DEBUG_PRINT("%s:%d: Watchdog thread entry point\n", __FUNCTION__, __LINE__);
+	while (1)
+	{
+		hWnd = FindWindowA(lpszClassName, NULL);
+		DEBUG_PRINT("%s:%d: FindWindowA: 0x%x\n", __FUNCTION__, __LINE__, hWnd);
+		if (hWnd != NULL)
+		{
+			char *lpszWindowText = (char*)dr_global_alloc(256);
 
-static void
-setup_pipe() {
-    pipe = CreateFile( 
-         options.pipe_name,   // pipe name 
-         GENERIC_READ |  // read and write access 
-         GENERIC_WRITE, 
-         0,              // no sharing 
-         NULL,           // default security attributes
-         OPEN_EXISTING,  // opens existing pipe 
-         0,              // default attributes 
-         NULL);          // no template file 
- 
-    if (pipe == INVALID_HANDLE_VALUE) DR_ASSERT_MSG(false, "error connecting to pipe");
-}
+			if (GetWindowTextA(hWnd, (char*)lpszWindowText, 256))
+			{
+				if (lpszWindowText[0] == 'M' && lpszWindowText[1] == 'i' &&
+					lpszWindowText[2] == 'c' && lpszWindowText[3] == 'r' &&
+					lpszWindowText[4] == 'o' && lpszWindowText[5] == 's' &&
+					lpszWindowText[6] == 'o' && lpszWindowText[7] == 'f' &&
+					lpszWindowText[8] == 't')
+				{
+					// Set focus to NUIDialog Window
+					SetForegroundWindow(hWnd);
+					// Animate keyboard to click
+					keybd_event(VK_RETURN, 0x1C /*ENTER*/, 0, 0);
+					keybd_event(VK_RETURN, 0x1C /*ENTER*/, KEYEVENTF_KEYUP, 0);
+				}
+			}
+			else
+			{
+				DR_ASSERT_MSG(false, "Failed GetWindowText");
+			}
 
-static void
-setup_shmem() {
-   HANDLE map_file;
+			dr_global_free(lpszWindowText, 256);
+			hWnd = NULL;
+			lpszWindowText = NULL;
+		}
+		dr_sleep(1000);
+	}
 
-   map_file = OpenFileMapping(
-                   FILE_MAP_ALL_ACCESS,   // read/write access
-                   FALSE,                 // do not inherit the name
-                   options.shm_name);            // name of mapping object
-
-   if (map_file == NULL) DR_ASSERT_MSG(false, "error accessing shared memory");
-
-   winafl_data.afl_area = (unsigned char *) MapViewOfFile(map_file, // handle to map object
-               FILE_MAP_ALL_ACCESS,  // read/write permission
-               0,
-               0,
-               MAP_SIZE);
-
-   if (winafl_data.afl_area == NULL) DR_ASSERT_MSG(false, "error accessing shared memory");
+	return;
 }
 
 static void
@@ -1189,47 +1013,6 @@ options_init(client_id_t id, int argc, const char *argv[])
             USAGE_CHECK((i + 1) < argc, "missing -file_arg_index number");
             options.file_arg_index = atoi(argv[++i]);
         }
-#ifdef _WMP
-		else if (strcmp(token, "-message_id") == 0) {
-			USAGE_CHECK((i + 1) < argc, "missing -message_id");
-			/*
-			*	A message id is typically used by event-based GUI software
-			*	You can select a message id that will trigger the file to be parsed
-			*   You can specify more than one message id using comma (",") as separator
-			*	(For example: On Windows Media Player, WMI_TIMER (0x8000) is triggered
-			*                 continuously)
-			*/
-			int size = strlen(argv[i+1]);
-			char *msg_ids = (char*)dr_global_alloc(size);
-			strncpy(msg_ids, argv[i+1], size);
-			char *p = msg_ids, *start_s = msg_ids;
-			int id = 0;
-			if (strrchr(msg_ids, ',') != NULL)
-			{
-				while (1)
-				{
-					if (*p == ',' || *p == '\0')
-					{
-						*p = '\0';
-						options.messageid[id] = atoi(start_s);
-						// Set the start string to next p
-						start_s = p + 1;
-						id++;
-					}
-
-					if (p++ >= (msg_ids + size + 1))
-						break;
-				}
-			}
-			else
-			{
-				options.messageid[id] = atoi(start_s);
-			}
-			__debugbreak();
-			dr_global_free(msg_ids, size);
-			i++;
-		}
-#endif
         else if (strcmp(token, "-single_test_case") == 0) {
             USAGE_CHECK((i + 1) < argc, "missing -single_test_case file path");
             /*
@@ -1266,6 +1049,13 @@ options_init(client_id_t id, int argc, const char *argv[])
             // The number of coverage depends on the number of input corpus
             options.cov_iterations = 0;
         }
+		else if (strcmp(token, "-human") == 0){
+			/* Start watchdog thread */
+			// FIXME: CreateThread call is successful, however the client thread is not started properly?
+			// FIXED: Used dr_create_client_thread instead (ref: http://dynamorio.org/docs/dr__tools_8h.html#ac6b80b83502ff13d4674b13e7b30b555)
+			dr_create_client_thread(thread_close_nuidialog, NULL);
+			DEBUG_PRINT("%s:%d Started watchdog thread\n", __FUNCTION__, __LINE__);
+		}
         else {
             NOTIFY(0, "UNRECOGNIZED OPTION: \"%s\"\n", token);
             USAGE_CHECK(false, "invalid option");
@@ -1284,12 +1074,14 @@ options_init(client_id_t id, int argc, const char *argv[])
     }
 }
 
+// --------------------------------------------------------------------
 /*
     filelist_init
     Get the list of test cases from initial corpus directory
     FIXME: If the number of test cases is big enough (eg: >15000),
            does it cause performance overhead?
 */
+// --------------------------------------------------------------------
 static void filelist_init()
 {
     input_corpus_t *input_corpus = options.corpus_list;
@@ -1387,11 +1179,8 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
 
     drmgr_register_exception_event(onexception);
 
-    if(options.coverage_kind == COVERAGE_BB) {
-        //drmgr_register_bb_instrumentation_event(NULL, instrument_bb_coverage, NULL);
-        drmgr_register_bb_instrumentation_event(event_basic_block_analysis, NULL, NULL);
-    } else if(options.coverage_kind == COVERAGE_EDGE) {
-        drmgr_register_bb_instrumentation_event(NULL, instrument_edge_coverage, NULL);
+	if (options.coverage_kind == COVERAGE_BB) {
+		drmgr_register_bb_instrumentation_event(event_basic_block_analysis, NULL, NULL);
     }
 
     drmgr_register_module_load_event(event_module_load);
@@ -1403,18 +1192,12 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
     if (options.nudge_kills)
         drx_register_soft_kills(event_soft_kill);
 
-    if(!options.debug_mode) {
-        setup_pipe();
-        setup_shmem();
-    }
-    else {
-        winafl_data.afl_area = (unsigned char *)dr_global_alloc(MAP_SIZE);
-    }
 
     tls_idx = drmgr_register_tls_field();
     if (tls_idx == -1)
     {
-        dr_fprintf(winafl_data.log, "Failed to allocate TLS");
+		if (options.debug_mode)
+			dr_fprintf(winafl_data.log, "Failed to allocate TLS");
         return;
     }
 

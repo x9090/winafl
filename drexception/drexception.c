@@ -48,6 +48,8 @@
 #include <windows.h>
 #include <stdlib.h>
 
+file_t logfile = NULL;
+
 void dbgprint(char *fmt, ...)
 {
 	do {
@@ -75,6 +77,8 @@ void __forceinline dbgbreak(void)
 #define DEBUG_BREAK __nop
 #endif
 
+int g_tempcount = 0;
+
 static void
 event_exit(void);
 
@@ -85,13 +89,38 @@ static bool
 onexception(void *drcontext, dr_exception_t *excpt) 
 {
 	DWORD exception_code = excpt->record->ExceptionCode;
+	DWORD count = 0;
+	uint size = 20;
+	app_pc except_pc;
+	instr_t instr;
+
+	instr_init(drcontext, &instr);
+
 	DEBUG_PRINT("Exception caught: %x\n", exception_code);
+	DEBUG_PRINT("Count: %d\n", ++g_tempcount);
+	dr_log(NULL, LOG_ALL, 1, "Exception caught : %x\n", exception_code);
+	dr_fprintf(logfile, "Exception caught : %x\n", exception_code);
 	if ((exception_code == EXCEPTION_ACCESS_VIOLATION) ||
 		(exception_code == EXCEPTION_ILLEGAL_INSTRUCTION) ||
 		(exception_code == EXCEPTION_PRIV_INSTRUCTION) ||
 		(exception_code == EXCEPTION_STACK_OVERFLOW)) {
+		except_pc = excpt->mcontext->pc;
+		//except_pc = excpt->raw_mcontext->pc;
+
+		DEBUG_PRINT("Crashed at: %08x\n", except_pc);
+		dr_fprintf(logfile, "Crashed at: %08x\n", except_pc);
+		dr_log(NULL, LOG_ALL, 1, "Crashed at: %08x\n", except_pc);
 		DEBUG_BREAK();
-		DEBUG_PRINT("Crashed at %08x: %x\n", excpt->mcontext->pc);
+		app_pc start_pc = except_pc;
+		// Print the disassembly at crashed instruction
+		while (start_pc < except_pc + size)
+		{
+			disassemble(drcontext, start_pc, logfile);
+			decode(drcontext, start_pc, &instr);
+			instr_get_opcode(&instr);
+			start_pc = decode_next_pc(drcontext, start_pc);
+		}
+
 		dr_exit_process(1);
 	}
 	return true;
@@ -108,15 +137,23 @@ event_exit(void)
 DR_EXPORT void
 dr_client_main(client_id_t id, int argc, const char *argv[])
 {
-	drreg_options_t ops = { sizeof(ops), 2 /*max slots needed: aflags*/, false };
+	drreg_options_t ops = { sizeof(ops), 20 /*max slots needed: aflags*/, false };
 
 	dr_set_client_name("DRException", "");
 
-	drmgr_init();
-	drx_init();
-	drreg_init(&ops);
-	drwrap_init();
+	DEBUG_BREAK();
+	if (!drmgr_init() || !drx_init() || drreg_init(&ops) != DRREG_SUCCESS)
+		DR_ASSERT(false);
+	
+	dr_log(NULL, LOG_ALL, 1, "Started DRException");
 
+	// Init log file handle
+	char output[MAXIMUM_PATH];
+	logfile = drx_open_unique_appid_file(".", dr_get_process_id(),
+										"drexception", "proc.log",
+										DR_FILE_ALLOW_LARGE,
+										output, sizeof(output));
+	DR_ASSERT_MSG(logfile != INVALID_FILE, "Failed to open logfile");
 	dr_register_exit_event(event_exit);
 	drmgr_register_exception_event(onexception);
 }

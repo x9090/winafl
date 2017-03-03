@@ -54,7 +54,7 @@
 /* Default memory limit for child process (MB): */
 
 #ifndef __x86_64__ 
-#  define MEM_LIMIT         25
+#  define MEM_LIMIT         300
 #else
 #  define MEM_LIMIT         50
 #endif /* ^!__x86_64__ */
