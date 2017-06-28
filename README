@@ -51,6 +51,14 @@ fuzzing mode, that is, executing multiple input samples without restarting the
 target process. This is accomplished by selecting a target function (that the
 user wants to fuzz) and instrumenting it so that it runs in a loop.
 
+WinAFL has been successfully used to identify bugs in Windows software, such as
+
+CVE-2016-7212 - found by Aral Yaman of Noser Engineering AG
+CVE-2017-0073 - found by Symeon Paraschoudis of SensePost
+CVE-2017-0190 - found by Symeon Paraschoudis of SensePost
+
+(Let me know if you know of any others and I'll include them in the list)
+
 3) Building WinAFL
 ------------------
 
@@ -64,7 +72,8 @@ you are fuzzing 64-bit targets and vice versa.
 3. Go to the directory containing the source
 
 4. Type the following commands. Modify the -DDynamoRIO_DIR flag to point to the
-location of your DynamoRIO cmake files (relative to the source directory).
+location of your DynamoRIO cmake files (either full path or relative to the
+source directory).
 
 For a 32-bit build:
 
@@ -120,8 +129,9 @@ The following instrumentation options are used
                      Either -target_method or -target_offset need to be
                      specified together with this option.
 
-  -target_method   - name of the method to fuzz in persistent mode. A symbol
-                     for the method needs to be exported for this to work.
+  -target_method   - name of the method to fuzz in persistent mode. For this to
+                     work either the method needs to be exported or the symbols
+					 for target_module need to be available.
                      Otherwise use -target_offset instead.
 
   -target_offset   - offset of the method to fuzz from the start of the module.
@@ -146,6 +156,9 @@ The following instrumentation options are used
                          * ms64: Microsoft x64 (Visual Studio)
                          * stdcall: cdecl or stdcall
                          * thiscall: thiscall
+
+  -thread_coverage - If set, WinAFL will only collect coverage from a thread
+                     that executed the target function
 
 In general, you should perform the following steps when fuzzing a new target:
 
@@ -190,19 +203,11 @@ Please refer above for the list of supported AFL and instrumentation options.
 In AFL options, you must specify the DynamoRIO binaries directory via the new
 -D option. You need to match the DynamoRIO and winafl.dll build (32 vs. 64 bit)
 to the target binary. -t (timeout) option is mandatory for winafl as execution
-time can vary significantly under instrumentation so it’s not a good idea to
+time can vary significantly under instrumentation so itÂ’s not a good idea to
 rely on the auto-determined values.
 
 You can use the same winafl options as in step 2 but remember to exclude the
 -debug flag and you'll probably want to increase the iteration count.
-
-Note that, unlike linux AFL, in WinAFL the default coverage mode is basic
-block. This is because in multithreaded (i.e. most real-world) applications
-every context switch would be interpreted as new coverage even when no new
-coverage actually occured. If you are confident that all your coverage modules
-execute only a single thread at a time you can change this by adding
--covtype edge
-to your instrumentation flags.
 
 As in afl-fuzz on Linux you can replace the input file param of the target
 binary with @@
@@ -214,7 +219,15 @@ afl-fuzz.exe -i in -o out -D C:\work\winafl\DynamoRIO\bin64 -t 20000 --
 -fuzz_iterations 5000 -target_module test_gdiplus.exe -target_offset 0x1270
 -nargs 2 -- test_gdiplus.exe @@
 
-That's it. Happy fuzzing! Let me know if you find any bugs.
+Alternately, if symbols for test_gdiplus.exe are available, you can use
+-target_method instead of -target_offset like so
+
+afl-fuzz.exe -i in -o out -D C:\work\winafl\DynamoRIO\bin64 -t 20000 --
+-coverage_module gdiplus.dll -coverage_module WindowsCodecs.dll
+-fuzz_iterations 5000 -target_module test_gdiplus.exe -target_method main
+-nargs 2 -- test_gdiplus.exe @@
+
+That's it. Happy fuzzing!
 
 5) How does my target run onder WinAFL
 --------------------------------------
@@ -284,6 +297,5 @@ to WinAFL and/or your target.
 
 9) Special Thanks
 -----------------
-
 Special thanks to Axel "0vercl0k" Souchet of MSRC Vulnerabilities and
 Mitigations Team for his contributions!
