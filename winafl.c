@@ -249,8 +249,6 @@ onexception(void *drcontext, dr_exception_t *excpt) {
        (exception_code == EXCEPTION_STACK_OVERFLOW)) {
 		DEBUG_BREAK();
 		dr_fprintf(winafl_data.log, "crashed at %08x\n", excpt->mcontext->pc);
-          if(options.debug_mode)
-            dr_fprintf(winafl_data.log, "crashed\n");
           if(!options.debug_mode)
             WriteFile(pipe, "C", 1, &num_written, NULL);
           dr_exit_process(1);
@@ -508,18 +506,21 @@ pre_fuzz_handler(void *wrapcxt, INOUT void **user_data)
         }
     } else {
         debug_data.pre_hanlder_called++;
-		dr_fprintf(winafl_data.log, "In pre_fuzz_handler: 0x%08x\n", target_to_fuzz);
+		if (options.debug_mode)
+			dr_fprintf(winafl_data.log, "In pre_fuzz_handler: 0x%08x\n", target_to_fuzz);
     }
 
     //save or restore arguments
     if(fuzz_target.iteration == 0) {
         for(i = 0; i < options.num_fuz_args; i++) {
             options.func_args[i] = drwrap_get_arg(wrapcxt, i);
-			dr_fprintf(winafl_data.log, "get arg(%d): 0x%x\n", i, options.func_args[i]);
+			if (options.debug_mode)
+				dr_fprintf(winafl_data.log, "get arg(%d): 0x%x\n", i, options.func_args[i]);
         }
     } else {
         for(i = 0; i < options.num_fuz_args; i++) {
-			dr_fprintf(winafl_data.log, "set arg(%d): 0x%x\n", i, options.func_args[i]);
+			if (options.debug_mode)
+				dr_fprintf(winafl_data.log, "set arg(%d): 0x%x\n", i, options.func_args[i]);
             drwrap_set_arg(wrapcxt, i, options.func_args[i]);
         }
     }
@@ -813,8 +814,8 @@ event_module_load(void *drcontext, const module_data_t *info, bool loaded)
         module_name = dr_module_preferred_name(info);
     }
 
-	//if (options.debug_mode)
-	dr_fprintf(winafl_data.log, "#%d Module loaded, %s, Loaded address: 0x%x, End address: 0x%x\n", mod_index++, module_name, info->start, info->end);
+	if (options.debug_mode)
+		dr_fprintf(winafl_data.log, "#%d Module loaded, %s, Loaded address: 0x%x, End address: 0x%x\n", mod_index++, module_name, info->start, info->end);
 
     if(options.fuzz_module[0]) {
 		if (_stricmp(module_name, options.fuzz_module) == 0) {
