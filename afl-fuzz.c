@@ -2181,7 +2181,9 @@ static void destroy_target_process(int wait_exit) {
 				ck_free(kill_cmd);
 
 				if (WaitForSingleObject(child_handle, 20000) == WAIT_TIMEOUT) {
-					FATAL("Cannot kill child process\n");
+					//FATAL("Cannot kill child process\n");
+					WARNF("Cannot kill child process\n");
+					system("pause");
 				}
 			}
 		}
@@ -2302,10 +2304,9 @@ static u8 run_target(char** argv) {
 	fuzz_iterations_current++;
 
 	if (fuzz_iterations_current == fuzz_iterations_max) {
+		dbgprint("%s:%d Reached fuzz_iterations_max, terminate process %c\n", __FUNCTION__, __LINE__);
 		destroy_target_process(2000);
 	}
-
-	//dbgprint("total_execs: %lld\n", total_execs);
 
   //printf("total_execs: %lld\n", total_execs);
 
@@ -2775,7 +2776,7 @@ static void link_or_copy(u8* old_path, u8* new_path) {
 	while ((i = read(sfd, tmp, 64 * 1024)) > 0)
 		ck_write(dfd, tmp, i, new_path);
 
-	if (i < 0) PFATAL("read() failed");
+	if (i < 0) { dbgprint("Failed: %s\n", old_path); PFATAL("read() failed"); }
 
 	ck_free(tmp);
 	close(sfd);
@@ -4783,7 +4784,7 @@ static u8 fuzz_one(char** argv) {
 
 	len = queue_cur->len;
 
-	orig_in = in_buf = (u8 *)malloc(len);
+	orig_in = in_buf = (u8 *)ck_alloc_nozero(len);
 	_read(fd, in_buf, len);
 
 	close(fd);
@@ -4859,7 +4860,10 @@ static u8 fuzz_one(char** argv) {
 	testing in earlier, resumed runs (passed_det). */
 
 	if (skip_deterministic || queue_cur->was_fuzzed || queue_cur->passed_det)
+	{
+		printf("Goto havoc stage (skip_deterministic:%d queue_cur->was_fuzzed:%d queue_cur->passed_det)\n", skip_deterministic, queue_cur->was_fuzzed, queue_cur->passed_det);
 		goto havoc_stage;
+	}
 
 	/*********************************************
 	* SIMPLE BITFLIP (+dictionary construction) *
@@ -6394,6 +6398,7 @@ abandon_entry:
 	}
 
 	if (in_buf != orig_in) ck_free(in_buf);
+	ck_free(orig_in);
 	ck_free(out_buf);
 	ck_free(eff_map);
 
@@ -7296,7 +7301,7 @@ int main(int argc, char** argv) {
 	out_dir = NULL;
 	dynamorio_dir = NULL;
 	client_params = NULL;
-
+	
 	while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QD:b:")) > 0)
 
 		switch (opt) {
@@ -7305,7 +7310,6 @@ int main(int argc, char** argv) {
 
 			if (in_dir) FATAL("Multiple -i options not supported");
 			in_dir = optarg;
-
 			if (!strcmp(in_dir, "-")) in_place_resume = 1;
 
 			break;

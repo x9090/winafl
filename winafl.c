@@ -41,6 +41,7 @@
 #define UNKNOWN_MODULE_ID USHRT_MAX
 
 static uint verbose;
+uint64 winafl_starttime = 0;
 
 #define NOTIFY(level, fmt, ...) do {          \
     if (verbose >= (level))                   \
@@ -899,6 +900,7 @@ static void
 event_exit(void)
 {
     if(options.debug_mode) {
+		uint64 winafl_endtime = get_cur_time() - winafl_starttime;
         if(debug_data.pre_hanlder_called == 0) {
             dr_fprintf(winafl_data.log, "WARNING: Target function was never called. Incorrect target_offset?\n");
         } else if(debug_data.post_handler_called == 0) {
@@ -907,6 +909,7 @@ event_exit(void)
             dr_fprintf(winafl_data.log, "Everything appears to be running normally.\n");
         }
 
+		dr_fprintf(winafl_data.log, "Time taken: %llu seconds\n", (winafl_endtime/1000));
         dr_fprintf(winafl_data.log, "Coverage map follows:\n");
         dump_winafl_data();
         dr_close_file(winafl_data.log);
@@ -948,7 +951,7 @@ event_init(void)
     }
 
 
-	else
+	else if (verbose >= 1)
 	{
 		winafl_data.log =
 			drx_open_unique_appid_file(options.logdir, dr_get_process_id(),
@@ -1230,6 +1233,9 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
         drmgr_register_thread_init_event(event_thread_init);
         drmgr_register_thread_exit_event(event_thread_exit);
     }
+	
+	if (options.debug_mode)
+		winafl_starttime = get_cur_time();
 
     event_init();
 }
