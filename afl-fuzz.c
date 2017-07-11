@@ -2180,7 +2180,8 @@ static void destroy_target_process(int wait_exit) {
               if (WaitForSingleObject(child_handle, 20000) == WAIT_TIMEOUT) {
                   //FATAL("Cannot kill child process\n");
                   WARNF("Cannot kill child process\n");
-                  system("pause");
+                  Sleep(20000);
+                  //system("pause");
               }
           }
       }
@@ -3125,6 +3126,8 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 #endif /* ^!SIMPLE_FILES */
 
       unique_crashes++;
+
+      last_crash_time = get_cur_time();
 
       last_crash_execs = total_execs;
 
