@@ -527,7 +527,8 @@ pre_fuzz_handler(void *wrapcxt, INOUT void **user_data)
             if(command == 'Q') {
                 dr_exit_process(0);
             } else {
-                DR_ASSERT_MSG(false, "unrecognized command received over pipe");
+                //DR_ASSERT_MSG(true, "unrecognized command received over pipe");
+                dr_exit_process(1);
             }
         }
     } else {

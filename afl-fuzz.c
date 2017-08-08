@@ -2177,11 +2177,19 @@ static void destroy_target_process(int wait_exit) {
 
               ck_free(kill_cmd);
 
+              // The process might already be terminated for unknown reason
+              // Our last resort is to issue exit command to WinAFL through IPC
               if (WaitForSingleObject(child_handle, 20000) == WAIT_TIMEOUT) {
-                  //FATAL("Cannot kill child process\n");
-                  WARNF("Cannot kill child process\n");
-                  Sleep(20000);
-                  //system("pause");
+                  HANDLE h = NULL;
+                  char command[] = "Q";
+                  int written;
+                  if ((h=OpenProcess(PROCESS_ALL_ACCESS, FALSE, child_pid))!=NULL && !WriteFile(pipe_handle, command, 1, &written, NULL))
+                  {
+                      WARNF("Cannot kill child process\n");
+                      printf("command: %s, written: %d\n", command, written);
+                      //system("pause");
+                      CloseHandle(h);
+                  }
               }
           }
       }
