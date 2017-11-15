@@ -37,7 +37,7 @@
 #include <direct.h>
 
 #define VERSION "2.43b"
-#define WINAFL_VERSION "1.09"
+#define WINAFL_VERSION "1.11"
 
 #include "config.h"
 #include "types.h"
@@ -118,7 +118,8 @@ static u8  skip_deterministic,        /* Skip deterministic stages?       */
            qemu_mode,                 /* Running in QEMU mode?            */
            skip_requested,            /* Skip request, via SIGUSR1        */
            run_over10m,               /* Run time over 10 minutes?        */
-           persistent_mode;           /* Running in persistent mode?      */
+           persistent_mode,           /* Running in persistent mode?      */
+           drioless = 0;              /* Running without DRIO?            */
 
 static s32 out_fd,                    /* Persistent fd for out_file       */
            dev_urandom_fd = -1,       /* Persistent fd for /dev/urandom   */
@@ -132,7 +133,7 @@ static s32 out_fd,                    /* Persistent fd for out_file       */
 HANDLE child_handle, child_thread_handle;
 char *dynamorio_dir;
 char *client_params;
-int fuzz_iterations_max, fuzz_iterations_current;
+int fuzz_iterations_max = 5000, fuzz_iterations_current;
 
 CRITICAL_SECTION critical_section;
 u64 watchdog_timeout_time;
@@ -365,8 +366,8 @@ static inline u32 UR(u32 limit) {
 
     u32 seed[2];
 
-	rand_s(&seed[0]);
-	rand_s(&seed[1]);
+    rand_s(&seed[0]);
+    rand_s(&seed[1]);
 
     srand(seed[0]);
     rand_cnt = (RESEED_RNG / 2) + (seed[1] % RESEED_RNG);
@@ -2043,14 +2044,16 @@ char *argv_to_cmd(char** argv) {
 }
 
 static void create_target_process(char** argv) {
-  char* dr_cmd;
-  char* pipe_name;
+  char *cmd;
+  char *pipe_name;
   char *buf;
   char *pidfile;
   FILE *fp;
   size_t pidsize;
   BOOL inherit_handles = TRUE;
 
+  HANDLE hJob = NULL;
+  JOBOBJECT_EXTENDED_LIMIT_INFORMATION job_limit;
   STARTUPINFO si;
   PROCESS_INFORMATION pi;
 
@@ -2066,22 +2069,15 @@ static void create_target_process(char** argv) {
     20000,                    // client time-out
     NULL);                    // default security attribute
 
-  if (pipe_handle == INVALID_HANDLE_VALUE)
-  {
-      FATAL("CreateNamedPipe failed, GLE=%d.\n", GetLastError());
+  if (pipe_handle == INVALID_HANDLE_VALUE) {
+    FATAL("CreateNamedPipe failed, GLE=%d.\n", GetLastError());
   }
 
   target_cmd = argv_to_cmd(argv);
 
-  pidfile = alloc_printf("childpid_%s.txt", fuzzer_id);
-  dr_cmd = alloc_printf(
-    "%s\\drrun.exe -pidfile %s -no_follow_children -c winafl.dll %s -fuzzer_id %s -- %s",
-    dynamorio_dir, pidfile, client_params, fuzzer_id, target_cmd
-  );
-
-  ZeroMemory( &si, sizeof(si) );
+  ZeroMemory(&si, sizeof(si));
   si.cb = sizeof(si);
-  ZeroMemory( &pi, sizeof(pi) );
+  ZeroMemory(&pi, sizeof(pi));
 
   if(sinkhole_stds) {
     si.hStdOutput = si.hStdError = devnul_handle;
@@ -2090,57 +2086,109 @@ static void create_target_process(char** argv) {
     inherit_handles = FALSE;
   }
 
-  if(!CreateProcess(NULL, dr_cmd, NULL, NULL, inherit_handles, /*CREATE_NO_WINDOW*/0, NULL, NULL, &si, &pi)) {
+  if(drioless) {
+    char *static_config = alloc_printf("%s:%d", fuzzer_id, fuzz_iterations_max);
+
+    if (static_config == NULL) {
+      FATAL("Cannot allocate static_config.");
+    }
+
+    SetEnvironmentVariable("AFL_STATIC_CONFIG", static_config);
+    cmd = alloc_printf("%s", target_cmd);
+    ck_free(static_config);
+  } else {
+    pidfile = alloc_printf("childpid_%s.txt", fuzzer_id);
+    cmd = alloc_printf(
+      "%s\\drrun.exe -pidfile %s -no_follow_children -c winafl.dll %s -fuzzer_id %s -- %s",
+      dynamorio_dir, pidfile, client_params, fuzzer_id, target_cmd
+    );
+  }
+
+  if(mem_limit != 0) {
+    hJob = CreateJobObject(NULL, NULL);
+    if(hJob == NULL) {
+      FATAL("CreateJobObject failed, GLE=%d.\n", GetLastError());
+    }
+
+    ZeroMemory(&job_limit, sizeof(job_limit));
+    job_limit.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+    job_limit.ProcessMemoryLimit = mem_limit * 1024 * 1024;
+
+    if(!SetInformationJobObject(
+      hJob,
+      JobObjectExtendedLimitInformation,
+      &job_limit,
+      sizeof(job_limit)
+    )) {
+      FATAL("SetInformationJobObject failed, GLE=%d.\n", GetLastError());
+    }
+  }
+
+  if(!CreateProcess(NULL, cmd, NULL, NULL, inherit_handles, CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
     FATAL("CreateProcess failed, GLE=%d.\n", GetLastError());
   }
 
   child_handle = pi.hProcess;
   child_thread_handle = pi.hThread;
 
+  if(mem_limit != 0) {
+    if(!AssignProcessToJobObject(hJob, child_handle)) {
+      FATAL("AssignProcessToJobObject failed, GLE=%d.\n", GetLastError());
+    }
+  }
+
+  ResumeThread(child_thread_handle);
+
   watchdog_timeout_time = get_cur_time() + exec_tmout;
   watchdog_enabled = 1;
 
   if(!ConnectNamedPipe(pipe_handle, NULL)) {
     if(GetLastError() != ERROR_PIPE_CONNECTED) {
-        FATAL("ConnectNamedPipe failed, GLE=%d.\n", GetLastError());
+      FATAL("ConnectNamedPipe failed, GLE=%d.\n", GetLastError());
     }
   }
 
   watchdog_enabled = 0;
 
-  //by the time pipe has connected the pidfile must have been created
-
-  fp = fopen(pidfile, "rb");
-  if(!fp) {
+  if(drioless == 0) {
+    //by the time pipe has connected the pidfile must have been created
+    fp = fopen(pidfile, "rb");
+    if(!fp) {
       FATAL("Error opening pidfile.txt");
+    }
+    fseek(fp,0,SEEK_END);
+    pidsize = ftell(fp);
+    fseek(fp,0,SEEK_SET);
+    buf = (char *)malloc(pidsize+1);
+    fread(buf, pidsize, 1, fp);
+    buf[pidsize] = 0;
+    fclose(fp);
+    remove(pidfile);
+    child_pid = atoi(buf);
+    free(buf);
+    ck_free(pidfile);
   }
-  fseek(fp,0,SEEK_END);
-  pidsize = ftell(fp);
-  fseek(fp,0,SEEK_SET);
-  buf = (char *)malloc(pidsize+1);
-  fread(buf, pidsize, 1, fp);
-  buf[pidsize] = 0;
-  fclose(fp);
-  remove(pidfile);
+  else {
+    child_pid = pi.dwProcessId;
+  }
 
-  child_pid = atoi(buf);
-
-  free(buf);
-  ck_free(pidfile);
   ck_free(target_cmd);
-  ck_free(dr_cmd);
+  ck_free(cmd);
   ck_free(pipe_name);
 }
 
+
 static void destroy_target_process(int wait_exit) {
-  char* kill_cmd;
-  STARTUPINFO si;
-  PROCESS_INFORMATION pi;
+	char* kill_cmd;
+	BOOL still_alive = TRUE;
+	STARTUPINFO si;
+	PROCESS_INFORMATION pi;
 
-  EnterCriticalSection(&critical_section);
+	EnterCriticalSection(&critical_section);
 
-  //nudge the child process
-  if(child_handle) {
+	if (!child_handle) {
+		goto leave;
+	}
 
       if (WaitForSingleObject(child_handle, wait_exit) == WAIT_TIMEOUT) {
 
@@ -2194,19 +2242,21 @@ static void destroy_target_process(int wait_exit) {
           }
       }
 
-    CloseHandle(child_handle);
-    CloseHandle(child_thread_handle);
+done:
+	CloseHandle(child_handle);
+	CloseHandle(child_thread_handle);
 
-    child_handle = NULL;
-  }
+	child_handle = NULL;
+	child_thread_handle = NULL;
 
-  //close the pipe
-  if(pipe_handle) {
-    DisconnectNamedPipe(pipe_handle); 
-    CloseHandle(pipe_handle);
+leave:
+	//close the pipe
+	if (pipe_handle) {
+		DisconnectNamedPipe(pipe_handle);
+		CloseHandle(pipe_handle);
 
-    pipe_handle = NULL;
-  }
+		pipe_handle = NULL;
+	}
 
 //#ifdef _WMP
 //	u8 localappdata[MAX_PATH];
@@ -6691,8 +6741,11 @@ static void usage(u8* argv0) {
 
        "  -i dir        - input directory with test cases\n"
        "  -o dir        - output directory for fuzzer findings\n"
-	   "  -D dir        - directory with DynamoRIO binaries (drrun, drconfig)\n"
-	   "  -t msec       - timeout for each run\n\n"
+       "  -t msec       - timeout for each run\n\n"
+
+       "Instrumentation type:\n\n"
+        "  -D dir        - directory with DynamoRIO binaries (drrun, drconfig)\n"
+        "  -Y            - enable the static instrumentation mode\n\n"
 
        "Execution control settings:\n\n"
 
@@ -7336,7 +7389,7 @@ int main(int argc, char** argv) {
   dynamorio_dir = NULL;
   client_params = NULL;
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QD:b:")) > 0)
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dYnCB:S:M:x:QD:b:")) > 0)
 
     switch (opt) {
 
@@ -7449,9 +7502,8 @@ int main(int argc, char** argv) {
 
           if (mem_limit < 5) FATAL("Dangerously low value of -m");
 
-        }
-
-        break;
+          break;
+      }
 
       case 'd':
 
@@ -7507,13 +7559,20 @@ int main(int argc, char** argv) {
 
         break;
 
+      case 'Y':
+
+        if (dynamorio_dir) FATAL("Dynamic-instrumentation via DRIO is uncompatible with static-instrumentation");
+        drioless = 1;
+
+        break;
+
       default:
 
         usage(argv[0]);
 
     }
 
-  if (optind == argc || !in_dir || !out_dir || !dynamorio_dir || !timeout_given) usage(argv[0]);
+  if (!in_dir || !out_dir || !timeout_given || (!drioless && !dynamorio_dir)) usage(argv[0]);
 
   extract_client_params(argc, argv);
   optind++;

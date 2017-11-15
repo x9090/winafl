@@ -3,6 +3,37 @@ ChangeLog
 =========
 
 ----------------------------------
+Version 1.12 (based on afl 2.43b):
+----------------------------------
+
+  - Windows port of afl-tmin
+    Contributed by Axel "0vercl0k" Souchet of MSRC Vulnerabilities and Mitigations Team
+
+----------------------------------
+Version 1.11 (based on afl 2.43b):
+----------------------------------
+
+  - Add support for setting a memory limit (-m flag)
+    Contributed by Axel "0vercl0k" Souchet of MSRC Vulnerabilities and Mitigations Team
+
+----------------------------------
+Version 1.10 (based on afl 2.43b):
+----------------------------------
+
+  - Add static instrumentation mode
+    Contributed by Axel "0vercl0k" Souchet of MSRC Vulnerabilities and Mitigations Team
+
+-----------------------------------
+Version 1.09b (based on afl 2.43b):
+-----------------------------------
+
+  - Fixed slave mode (broken by 1.09 update)
+    Contributed by Axel "0vercl0k" Souchet of MSRC Vulnerabilities and Mitigations Team
+
+  - Fixed missing last_crash_time (broken by 1.09 update)
+    Contributed by x9090
+
+----------------------------------
 Version 1.09 (based on afl 2.43b):
 ----------------------------------
 

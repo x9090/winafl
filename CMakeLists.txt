@@ -7,6 +7,21 @@ add_executable(test
   test.cpp
   )
 
+if(NOT "${CMAKE_GENERATOR}" MATCHES "(Win64)")
+
+  project(test_static)
+
+  add_executable(test_static
+    test_static.cpp
+    afl-staticinstr.c
+    )
+
+  target_link_libraries(test_static "psapi.lib")
+
+  set_target_properties(test_static PROPERTIES COMPILE_FLAGS "/EHsc")
+  set_target_properties(test_static PROPERTIES LINK_FLAGS "/PROFILE")
+
+endif()
 
 project(test_gdiplus)
 
@@ -22,13 +37,17 @@ add_executable(afl-showmap
   afl-showmap.c
   )
 
-
 project(afl-fuzz)
 
 add_executable(afl-fuzz
   afl-fuzz.c
   )
 
+project(afl-tmin)
+
+add_executable(afl-tmin
+  afl-tmin.c
+  )
 
 
 project(WinAFL)
